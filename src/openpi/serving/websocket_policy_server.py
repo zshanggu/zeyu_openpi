@@ -56,7 +56,8 @@ class WebsocketPolicyServer:
             try:
                 start_time = time.monotonic()
                 obs = msgpack_numpy.unpackb(await websocket.recv())
-
+                logger.info(f"Received prompt: {obs.get('prompt', 'NO PROMPT SENT')}")
+                
                 infer_time = time.monotonic()
                 action = self._policy.infer(obs)
                 infer_time = time.monotonic() - infer_time
