@@ -1,10 +1,14 @@
 import collections
+import csv
 import dataclasses
 import logging
 import math
 import pathlib
 
 import imageio
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from libero.libero import benchmark
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
@@ -99,6 +103,7 @@ def eval_libero(args: Args) -> None:
             # Setup
             t = 0
             replay_images = []
+            attn_buffer = []  # per-inference-call attention info: list of {"lang_attn": [L], "img_attn": [L]}
 
             logging.info(f"Starting episode {task_episodes+1}...")
             while t < max_steps + args.num_steps_wait:
@@ -140,8 +145,15 @@ def eval_libero(args: Args) -> None:
                             "prompt": str(task_description),
                         }
 
-                        # Query model to get action
-                        action_chunk = client.infer(element)["actions"]
+                        # Query model to get action (and collect attention info if available)
+                        result = client.infer(element)
+                        action_chunk = result["actions"]
+                        logging.info(f"[attn] result keys: {list(result.keys())}")
+                        if "attn_info" in result:
+                            attn_buffer.append(result["attn_info"])
+                            logging.info(f"[attn] collected step {len(attn_buffer)}, lang_attn mean={result['attn_info']['lang_attn'].mean():.4f}")
+                        else:
+                            logging.warning("[attn] 'attn_info' not in result — server may not have the updated code")
                         assert (
                             len(action_chunk) >= args.replan_steps
                         ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
@@ -180,6 +192,44 @@ def eval_libero(args: Args) -> None:
             frame_dir.mkdir(parents=True, exist_ok=True)
             for frame_idx, frame in enumerate(replay_images):
                 imageio.imwrite(frame_dir / f"{frame_idx:04d}.png", np.asarray(frame))
+
+            # Save per-inference-step attention analysis (action expert → language/image tokens)
+            # Shape: [num_inference_calls, num_expert_layers]
+            logging.info(f"[attn] episode done, attn_buffer size={len(attn_buffer)}, saving to {frame_dir}")
+            if attn_buffer:
+                lang_attn = np.stack([a["lang_attn"] for a in attn_buffer], axis=0)  # [T, L]
+                img_attn = np.stack([a["img_attn"] for a in attn_buffer], axis=0)    # [T, L]
+                np.save(frame_dir / "lang_attn_over_time.npy", lang_attn)
+                np.save(frame_dir / "img_attn_over_time.npy", img_attn)
+
+                # Save CSV log: one row per inference step
+                num_layers = lang_attn.shape[1]
+                with open(frame_dir / "attn_log.csv", "w", newline="") as f:
+                    writer = csv.writer(f)
+                    header = ["step"] + [f"lang_L{i}" for i in range(num_layers)] + ["lang_mean"] + \
+                             [f"img_L{i}" for i in range(num_layers)] + ["img_mean"]
+                    writer.writerow(header)
+                    for step_idx, (lang_row, img_row) in enumerate(zip(lang_attn, img_attn)):
+                        writer.writerow([step_idx] + lang_row.tolist() + [lang_row.mean()] +
+                                        img_row.tolist() + [img_row.mean()])
+
+                # Plot attention curves (mean over layers + per-layer)
+                steps = np.arange(len(lang_attn))
+                fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+                for layer_idx in range(num_layers):
+                    axes[0].plot(steps, lang_attn[:, layer_idx], alpha=0.3, linewidth=0.8)
+                    axes[1].plot(steps, img_attn[:, layer_idx], alpha=0.3, linewidth=0.8)
+                axes[0].plot(steps, lang_attn.mean(axis=1), color="black", linewidth=2, label="mean")
+                axes[1].plot(steps, img_attn.mean(axis=1), color="black", linewidth=2, label="mean")
+                for ax, title in zip(axes, ["Language attention", "Image attention"]):
+                    ax.set_xlabel("Inference step")
+                    ax.set_ylabel("Attention score")
+                    ax.set_title(title)
+                    ax.legend()
+                fig.suptitle(video_stem, fontsize=9)
+                fig.tight_layout()
+                fig.savefig(frame_dir / "attn_curve.png", dpi=120)
+                plt.close(fig)
 
             # Log current results
             logging.info(f"Success: {done}")

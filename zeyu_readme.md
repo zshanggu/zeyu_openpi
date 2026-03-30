@@ -81,6 +81,8 @@ docker run -it \
   libero \
   bash -c "source /.venv/bin/activate && python examples/libero/main.py"
 
+docker start -ai zeyu_libero_sim
+
 # LIBERO-10 (long horizon)
 docker run -it \
   --network host \
@@ -98,7 +100,7 @@ docker run -it \
   libero \
   bash -c "source /.venv/bin/activate && python examples/libero/main.py --args.task-suite-name libero_10"
 
-docker start -ai zeyu_libero_sim
+docker start -ai zeyu_libero10_sim
 
 ### DROID
 

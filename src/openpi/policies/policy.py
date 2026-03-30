@@ -88,12 +88,47 @@ class Policy(BasePolicy):
             sample_kwargs["noise"] = noise
 
         observation = _model.Observation.from_dict(inputs)
+
+        # Enable JAX attention capture for non-PyTorch (JAX) models
+        attn_info = None
+        if not self._is_pytorch_model:
+            from openpi.models import gemma as _gemma_module
+            # SigLIP So400m/14: patch_size=14, num_tokens = (H//14)*(W//14) per image.
+            # Use tree_leaves to find all 4D RGB image arrays regardless of dict structure.
+            _SIGLIP_PATCH = 14
+            num_img_tokens = sum(
+                (v.shape[1] // _SIGLIP_PATCH) * (v.shape[2] // _SIGLIP_PATCH)
+                for v in jax.tree_util.tree_leaves(inputs)
+                if hasattr(v, "shape") and v.ndim == 4 and v.shape[-1] == 3
+            )
+            num_lang_tokens = int(observation.tokenized_prompt.shape[-1])
+            logging.info(f"[attn] num_img_tokens={num_img_tokens}, num_lang_tokens={num_lang_tokens}")
+            _gemma_module._attn_capture_num_img_tokens = num_img_tokens
+            _gemma_module._attn_capture_num_lang_tokens = num_lang_tokens
+            _gemma_module._attn_capture_store.clear()
+            _gemma_module._attn_capture_enabled = True
+
         start_time = time.monotonic()
         outputs = {
             "state": inputs["state"],
             "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
         }
         model_time = time.monotonic() - start_time
+
+        if not self._is_pytorch_model:
+            _gemma_module._attn_capture_enabled = False
+            store = _gemma_module._attn_capture_store
+            logging.info(f"[attn] captured {len(store)} attention snapshots")
+            if store:
+                attn_info = {
+                    "lang_attn": np.array([np.mean([e["lang_mean"] for e in store])], dtype=np.float32),
+                    "img_attn": np.array([np.mean([e["img_mean"] for e in store])], dtype=np.float32),
+                }
+
+        # Extract attention info from PyTorch model if available (before tree_map)
+        if self._is_pytorch_model and hasattr(self._model, "last_attn_info"):
+            attn_info = self._model.last_attn_info
+
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
         else:
@@ -103,6 +138,8 @@ class Policy(BasePolicy):
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
+        if attn_info is not None:
+            outputs["attn_info"] = attn_info
         return outputs
 
     @property

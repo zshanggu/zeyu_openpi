@@ -33,10 +33,33 @@ import einops
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import numpy as _np
 
 import openpi.models.lora as lora
 import openpi.shared.array_typing as at
 import openpi.training.sharding as sharding
+
+# Module-level state for attention capture during JAX inference.
+# Enabled from policy.py around each inference call.
+_attn_capture_enabled: bool = False
+_attn_capture_store: list = []          # list of {"lang_mean": float, "img_mean": float}
+_attn_capture_num_img_tokens: int = 0   # total image patch tokens in prefix
+_attn_capture_num_lang_tokens: int = 0  # language tokens in prefix
+
+
+def _attn_callback(probs):
+    """Called via jax.debug.callback during execution with actual attention weights."""
+    if not _attn_capture_enabled:
+        return
+    ni = _attn_capture_num_img_tokens
+    nl = _attn_capture_num_lang_tokens
+    # probs shape: [B, K, G, T, S]  (T=suffix_len, S=prefix_len+suffix_len)
+    lang_p = probs[:, :, :, :, ni : ni + nl]
+    img_p = probs[:, :, :, :, :ni]
+    _attn_capture_store.append({
+        "lang_mean": float(lang_p.sum(-1).mean()),
+        "img_mean": float(img_p.sum(-1).mean()),
+    })
 
 PALIGEMMA_VOCAB_SIZE = 257_152
 
@@ -226,6 +249,12 @@ class Attention(nn.Module):
         masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
 
         probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
+
+        # Capture attention weights from action-expert suffix calls (kv_cache is not None).
+        # jax.debug.callback fires at execution time (not trace time), so the Python-level
+        # _attn_capture_enabled flag is checked inside the callback, not at trace time.
+        if kv_cache is not None:
+            jax.debug.callback(_attn_callback, probs.astype(jnp.float32))
 
         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")

@@ -1,6 +1,7 @@
 import logging
 import math
 
+import numpy as np
 import torch
 from torch import Tensor
 from torch import nn
@@ -195,6 +196,7 @@ class PI0Pytorch(nn.Module):
         att_masks = []
 
         # Process images
+        total_img_tokens = 0
         for img, img_mask in zip(images, img_masks, strict=True):
 
             def image_embed_func(img):
@@ -203,6 +205,7 @@ class PI0Pytorch(nn.Module):
             img_emb = self._apply_checkpoint(image_embed_func, img)
 
             bsize, num_img_embs = img_emb.shape[:2]
+            total_img_tokens += num_img_embs
 
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
@@ -224,6 +227,10 @@ class PI0Pytorch(nn.Module):
         # full attention between image and language inputs
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
+
+        # Track prefix token counts for attention analysis
+        self._last_num_img_tokens = total_img_tokens
+        self._last_num_lang_tokens = num_lang_embs
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -402,21 +409,58 @@ class PI0Pytorch(nn.Module):
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
-        x_t = noise
-        time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        while time >= -dt / 2:
-            expanded_time = time.expand(bsize)
-            v_t = self.denoise_step(
-                state,
-                prefix_pad_masks,
-                past_key_values,
-                x_t,
-                expanded_time,
-            )
+        # Setup running attention accumulators for analysis (action expert → language tokens)
+        num_img_tokens = self._last_num_img_tokens
+        num_lang_tokens = self._last_num_lang_tokens
+        num_expert_layers = len(self.paligemma_with_expert.gemma_expert.model.layers)
+        lang_attn_sum = np.zeros(num_expert_layers, dtype=np.float64)
+        img_attn_sum = np.zeros(num_expert_layers, dtype=np.float64)
+        attn_step_count = np.zeros(num_expert_layers, dtype=np.int64)
 
-            # Euler step - use new tensor assignment instead of in-place operation
-            x_t = x_t + dt * v_t
-            time += dt
+        def make_attn_hook(layer_idx):
+            def hook(module, input, output):
+                if not (isinstance(output, tuple) and len(output) >= 2 and output[1] is not None):
+                    return
+                # attn_weights: [B, H, suffix_len, prefix_len + suffix_len]
+                w = output[1].detach().cpu().float().numpy()
+                lang_attn_sum[layer_idx] += w[:, :, :, num_img_tokens:num_img_tokens + num_lang_tokens].sum(-1).mean()
+                img_attn_sum[layer_idx] += w[:, :, :, :num_img_tokens].sum(-1).mean()
+                attn_step_count[layer_idx] += 1
+            return hook
+
+        hooks = [
+            layer.self_attn.register_forward_hook(make_attn_hook(i))
+            for i, layer in enumerate(self.paligemma_with_expert.gemma_expert.model.layers)
+        ]
+
+        try:
+            x_t = noise
+            time = torch.tensor(1.0, dtype=torch.float32, device=device)
+            while time >= -dt / 2:
+                expanded_time = time.expand(bsize)
+                v_t = self.denoise_step(
+                    state,
+                    prefix_pad_masks,
+                    past_key_values,
+                    x_t,
+                    expanded_time,
+                )
+
+                # Euler step - use new tensor assignment instead of in-place operation
+                x_t = x_t + dt * v_t
+                time += dt
+        finally:
+            for h in hooks:
+                h.remove()
+
+        nonzero = attn_step_count > 0
+        lang_attn = np.where(nonzero, lang_attn_sum / np.maximum(attn_step_count, 1), 0.0)
+        img_attn = np.where(nonzero, img_attn_sum / np.maximum(attn_step_count, 1), 0.0)
+        self.last_attn_info = {
+            "lang_attn": lang_attn.astype(np.float32),  # [num_expert_layers]
+            "img_attn": img_attn.astype(np.float32),    # [num_expert_layers]
+        }
+
         return x_t
 
     def denoise_step(
