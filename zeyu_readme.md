@@ -63,6 +63,8 @@ sudo docker run -it \
   -e SERVER_ARGS="--env LIBERO" \
   openpi_server
 
+docker start -ai zeyu_openpi_libero
+
 docker run -it \
   --network host \
   --gpus all \

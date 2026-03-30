@@ -167,12 +167,19 @@ def eval_libero(args: Args) -> None:
             # Save a replay video of the episode
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
+            video_stem = f"rollout_{task_segment}_ep{episode_idx}_{suffix}"
             imageio.mimwrite(
                 # pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
-                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_ep{episode_idx}_{suffix}.mp4",
+                pathlib.Path(args.video_out_path) / f"{video_stem}.mp4",
                 [np.asarray(x) for x in replay_images],
                 fps=10,
             )
+
+            # Save individual frames in a folder with the same name as the video
+            frame_dir = pathlib.Path(args.video_out_path) / video_stem
+            frame_dir.mkdir(parents=True, exist_ok=True)
+            for frame_idx, frame in enumerate(replay_images):
+                imageio.imwrite(frame_dir / f"{frame_idx:04d}.png", np.asarray(frame))
 
             # Log current results
             logging.info(f"Success: {done}")
