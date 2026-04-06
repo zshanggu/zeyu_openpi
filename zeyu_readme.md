@@ -65,6 +65,31 @@ sudo docker run -it \
 
 docker start -ai zeyu_openpi_libero
 
+# pi0
+
+sudo docker run -it \
+  -v /etc/localtime:/etc/localtime:ro \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  -e DISPLAY=$DISPLAY \
+  --shm-size 8g \
+  --network host \
+  --gpus all \
+  --ipc=host \
+  -v /media:/media \
+  -v /data:/data \
+  -v /home:/home \
+  -v ~/.cache/openpi:/openpi_assets \
+  -v ~/PHD_LAB/Course/CSCI662/zeyu_openpi:/app \
+  -e OPENPI_DATA_HOME=/openpi_assets \
+  -e IS_DOCKER=true \
+  --user root \
+  --name zeyu_openpi_libero_pi0 \
+  -e SERVER_ARGS="policy:checkpoint --policy.config pi0_libero --policy.dir gs://openpi-assets/checkpoints/pi0_libero" \
+  openpi_server
+
+docker start -ai zeyu_openpi_libero_pi0
+
+# LIBERO
 docker run -it \
   --network host \
   --gpus all \
