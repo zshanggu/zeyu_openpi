@@ -67,6 +67,9 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.prompt_repeat_n = config.prompt_repeat_n
+        if self.prompt_repeat_n > 1:
+            logger.info("Instruction repetition enabled: prompt_repeat_n=%d", self.prompt_repeat_n)
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -127,8 +130,15 @@ class Pi0(_model.BaseModel):
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+            if self.prompt_repeat_n > 1:
+                # Repeat the prompt N times in the prefix so action tokens have more
+                # language key positions to attend to (helps long-horizon tasks).
+                tokenized_inputs = jnp.tile(tokenized_inputs, (1, self.prompt_repeat_n, 1))
+                prompt_mask = jnp.tile(obs.tokenized_prompt_mask, (1, self.prompt_repeat_n))
+            else:
+                prompt_mask = obs.tokenized_prompt_mask
             tokens.append(tokenized_inputs)
-            input_mask.append(obs.tokenized_prompt_mask)
+            input_mask.append(prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
         tokens = jnp.concatenate(tokens, axis=1)
