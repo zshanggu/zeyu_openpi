@@ -45,6 +45,7 @@ _attn_capture_enabled: bool = False
 _attn_capture_store: list = []          # list of {"lang_mean": float, "img_mean": float}
 _attn_capture_num_img_tokens: int = 0   # total image patch tokens in prefix
 _attn_capture_num_lang_tokens: int = 0  # language tokens in prefix
+_attn_capture_num_layers: int = 18      # action expert depth (gemma_300m = 18)
 
 
 def _attn_callback(probs):

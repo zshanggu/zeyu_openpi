@@ -120,14 +120,28 @@ class Policy(BasePolicy):
             store = _gemma_module._attn_capture_store
             logging.info(f"[attn] captured {len(store)} attention snapshots")
             if store:
+                num_layers = _gemma_module._attn_capture_num_layers
+                lang_vals = np.array([e["lang_mean"] for e in store])  # [num_steps * num_layers]
+                img_vals  = np.array([e["img_mean"]  for e in store])
+                num_steps = len(store) // num_layers
+                # store cycles through layers 0..num_layers-1 for each denoising step
+                lang_per_layer = lang_vals[: num_steps * num_layers].reshape(num_steps, num_layers).mean(axis=0)
+                img_per_layer  = img_vals[: num_steps * num_layers].reshape(num_steps, num_layers).mean(axis=0)
                 attn_info = {
-                    "lang_attn": np.array([np.mean([e["lang_mean"] for e in store])], dtype=np.float32),
-                    "img_attn": np.array([np.mean([e["img_mean"] for e in store])], dtype=np.float32),
+                    "lang_attn": lang_per_layer.astype(np.float32),  # [num_layers]
+                    "img_attn":  img_per_layer.astype(np.float32),   # [num_layers]
                 }
 
         # Extract attention info from PyTorch model if available (before tree_map)
         if self._is_pytorch_model and hasattr(self._model, "last_attn_info"):
             attn_info = self._model.last_attn_info
+            lang = attn_info["lang_attn"]
+            img = attn_info["img_attn"]
+            per_layer = "  ".join(
+                f"L{i:02d} lang={lang[i]:.3f} img={img[i]:.3f} sum={lang[i]+img[i]:.3f}"
+                for i in range(len(lang))
+            )
+            logging.info(f"[attn/layer] {per_layer}")
 
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)

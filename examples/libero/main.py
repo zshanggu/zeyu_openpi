@@ -46,8 +46,8 @@ class Args:
     # Pass multiple times on the CLI: --extra-prompts "Stay still" --extra-prompts "Pick up the apple"
     extra_prompts: List[str] = dataclasses.field(
         default_factory=lambda: [
-            "Stay still and do nothing",
-            "Pick up the apple and put it in the bowl",
+            # "Stay still and do nothing",
+            # "Pick up the apple and put it in the bowl",
             # Add or remove prompts here — no need to recreate the container.
         ]
     )
@@ -173,7 +173,13 @@ def eval_libero(args: Args) -> None:
                             logging.info(f"[attn] result keys: {list(result.keys())}")
                             if "attn_info" in result:
                                 attn_buffer.append(result["attn_info"])
-                                logging.info(f"[attn] collected step {len(attn_buffer)}, lang_attn mean={result['attn_info']['lang_attn'].mean():.4f}")
+                                _lang = result["attn_info"]["lang_attn"]
+                                _img  = result["attn_info"]["img_attn"]
+                                _per_layer = "  ".join(
+                                    f"L{i:02d} lang={_lang[i]:.3f} img={_img[i]:.3f} sum={_lang[i]+_img[i]:.3f}"
+                                    for i in range(len(_lang))
+                                )
+                                logging.info(f"[attn] step={len(attn_buffer):03d}  {_per_layer}")
                             else:
                                 logging.warning("[attn] 'attn_info' not in result — server may not have the updated code")
                             assert (
@@ -218,8 +224,9 @@ def eval_libero(args: Args) -> None:
                 # Shape: [num_inference_calls, num_expert_layers]
                 logging.info(f"[attn] episode done, attn_buffer size={len(attn_buffer)}, saving to {frame_dir}")
                 if attn_buffer:
-                    lang_attn = np.stack([a["lang_attn"] for a in attn_buffer], axis=0)  # [T, L]
-                    img_attn = np.stack([a["img_attn"] for a in attn_buffer], axis=0)    # [T, L]
+                    lang_attn  = np.stack([a["lang_attn"] for a in attn_buffer], axis=0)   # [T, L]
+                    img_attn   = np.stack([a["img_attn"]  for a in attn_buffer], axis=0)   # [T, L]
+                    other_attn = 1.0 - lang_attn - img_attn                                 # [T, L]
                     np.save(frame_dir / "lang_attn_over_time.npy", lang_attn)
                     np.save(frame_dir / "img_attn_over_time.npy", img_attn)
 
@@ -227,30 +234,81 @@ def eval_libero(args: Args) -> None:
                     num_layers = lang_attn.shape[1]
                     with open(frame_dir / "attn_log.csv", "w", newline="") as f:
                         writer = csv.writer(f)
-                        header = ["step"] + [f"lang_L{i}" for i in range(num_layers)] + ["lang_mean"] + \
-                                 [f"img_L{i}" for i in range(num_layers)] + ["img_mean"]
+                        header = (["step"] +
+                                  [f"lang_L{i}"  for i in range(num_layers)] + ["lang_mean"] +
+                                  [f"img_L{i}"   for i in range(num_layers)] + ["img_mean"] +
+                                  [f"other_L{i}" for i in range(num_layers)] + ["other_mean"])
                         writer.writerow(header)
-                        for step_idx, (lang_row, img_row) in enumerate(zip(lang_attn, img_attn)):
-                            writer.writerow([step_idx] + lang_row.tolist() + [lang_row.mean()] +
-                                            img_row.tolist() + [img_row.mean()])
+                        for step_idx, (lang_row, img_row, other_row) in enumerate(
+                            zip(lang_attn, img_attn, other_attn)
+                        ):
+                            writer.writerow(
+                                [step_idx] +
+                                lang_row.tolist()  + [lang_row.mean()] +
+                                img_row.tolist()   + [img_row.mean()] +
+                                other_row.tolist() + [other_row.mean()]
+                            )
 
-                    # Plot attention curves (mean over layers + per-layer)
                     steps = np.arange(len(lang_attn))
-                    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+                    # Figure 1: per-layer curves — 3 rows × 6 cols grid
+                    nrows, ncols = 3, 6
+                    fig1, axes1 = plt.subplots(nrows, ncols, figsize=(18, 8), sharex=True, sharey=True)
                     for layer_idx in range(num_layers):
-                        axes[0].plot(steps, lang_attn[:, layer_idx], alpha=0.3, linewidth=0.8)
-                        axes[1].plot(steps, img_attn[:, layer_idx], alpha=0.3, linewidth=0.8)
-                    axes[0].plot(steps, lang_attn.mean(axis=1), color="black", linewidth=2, label="mean")
-                    axes[1].plot(steps, img_attn.mean(axis=1), color="black", linewidth=2, label="mean")
-                    for ax, title in zip(axes, ["Language attention", "Image attention"]):
-                        ax.set_xlabel("Inference step")
-                        ax.set_ylabel("Attention score")
-                        ax.set_title(title)
-                        ax.legend()
-                    fig.suptitle(f"{video_stem}\nprompt: {prompt_text}", fontsize=8)
-                    fig.tight_layout()
-                    fig.savefig(frame_dir / "attn_curve.png", dpi=120)
-                    plt.close(fig)
+                        ax = axes1[layer_idx // ncols, layer_idx % ncols]
+                        ax.plot(steps, lang_attn[:, layer_idx],  color="tab:blue",   linewidth=1.2, label="lang")
+                        ax.plot(steps, img_attn[:, layer_idx],   color="tab:orange", linewidth=1.2, label="img")
+                        ax.plot(steps, other_attn[:, layer_idx], color="tab:green",  linewidth=1.2, label="other")
+                        ax.set_title(f"L{layer_idx:02d}", fontsize=8)
+                        ax.set_ylim(0, 1)
+                        ax.tick_params(labelsize=6)
+                        if layer_idx == 0:
+                            ax.legend(fontsize=6, loc="upper right")
+                    for ax in axes1.flat:
+                        ax.set_xlabel("Step", fontsize=7)
+                        ax.set_ylabel("Attn", fontsize=7)
+                    fig1.suptitle(f"Per-layer attention (lang / img / other)\n{video_stem}\nprompt: {prompt_text}", fontsize=8)
+                    fig1.tight_layout()
+                    fig1.savefig(frame_dir / "attn_per_layer.png", dpi=120)
+                    plt.close(fig1)
+
+                    # Figure 2: mean attention over all layers
+                    fig2, ax2 = plt.subplots(figsize=(8, 4))
+                    ax2.plot(steps, lang_attn.mean(axis=1),  color="tab:blue",   linewidth=2, label="lang (mean)")
+                    ax2.plot(steps, img_attn.mean(axis=1),   color="tab:orange", linewidth=2, label="img (mean)")
+                    ax2.plot(steps, other_attn.mean(axis=1), color="tab:green",  linewidth=2, label="other (mean)")
+                    ax2.set_xlabel("Inference step")
+                    ax2.set_ylabel("Attention score")
+                    ax2.set_title("Mean attention over 18 layers")
+                    ax2.set_ylim(0, 1)
+                    ax2.legend()
+                    fig2.suptitle(f"{video_stem}\nprompt: {prompt_text}", fontsize=8)
+                    fig2.tight_layout()
+                    fig2.savefig(frame_dir / "attn_mean.png", dpi=120)
+                    plt.close(fig2)
+
+                    # Figure 3: 2-panel mean attention (lang / img), auto-scaled y-axis
+                    fig3, (ax3_lang, ax3_img) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+                    lang_mean = lang_attn.mean(axis=1)
+                    img_mean  = img_attn.mean(axis=1)
+
+                    ax3_lang.plot(steps, lang_mean, color="tab:blue", linewidth=2)
+                    ax3_lang.set_ylabel("Attention score")
+                    ax3_lang.set_title("Mean attention → language tokens")
+                    margin = (lang_mean.max() - lang_mean.min()) * 0.15 + 1e-6
+                    ax3_lang.set_ylim(lang_mean.min() - margin, lang_mean.max() + margin)
+
+                    ax3_img.plot(steps, img_mean, color="tab:orange", linewidth=2)
+                    ax3_img.set_xlabel("Inference step")
+                    ax3_img.set_ylabel("Attention score")
+                    ax3_img.set_title("Mean attention → image tokens")
+                    margin = (img_mean.max() - img_mean.min()) * 0.15 + 1e-6
+                    ax3_img.set_ylim(img_mean.min() - margin, img_mean.max() + margin)
+
+                    fig3.suptitle(f"{video_stem}\nprompt: {prompt_text}", fontsize=8)
+                    fig3.tight_layout()
+                    fig3.savefig(frame_dir / "attn_mean_2panel.png", dpi=120)
+                    plt.close(fig3)
 
                 # Log current results
                 logging.info(f"Success: {done}")
