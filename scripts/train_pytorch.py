@@ -448,6 +448,28 @@ def train_loop(config: _config.TrainConfig):
         )
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
+    # Freeze backbone when LoRA variants are configured, matching JAX freeze_filter behavior.
+    # Only the action expert + small projection heads are trained; the PaliGemma backbone is frozen.
+    raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    use_lora = (
+        hasattr(config.model, "paligemma_variant")
+        and config.model.paligemma_variant is not None
+        and "lora" in config.model.paligemma_variant
+    )
+    if use_lora:
+        for param in raw_model.paligemma_with_expert.paligemma.parameters():
+            param.requires_grad_(False)
+        trainable_params = [p for p in raw_model.parameters() if p.requires_grad]
+        trainable_mb = sum(p.numel() * p.element_size() for p in trainable_params) / 1e6
+        total_params = sum(p.numel() for p in raw_model.parameters())
+        trainable_count = sum(p.numel() for p in trainable_params)
+        logging.info(
+            f"LoRA-style freeze: {trainable_count / 1e6:.1f}M / {total_params / 1e6:.1f}M params trainable "
+            f"({trainable_mb:.0f} MB)"
+        )
+    else:
+        trainable_params = list(raw_model.parameters())
+
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
     peak_lr = config.lr_schedule.peak_lr
@@ -456,7 +478,7 @@ def train_loop(config: _config.TrainConfig):
 
     # Create optimizer with config parameters
     optim = torch.optim.AdamW(
-        model.parameters(),
+        trainable_params,
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,

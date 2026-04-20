@@ -169,3 +169,38 @@ sudo docker run -it \
   --name zeyu_openpi_base \
   -e SERVER_ARGS="policy:checkpoint --policy.config=pi05_base --policy.dir=gs://openpi-assets/checkpoints/pi05_base" \
   openpi_server
+
+
+# Train
+1. Set up the environment
+
+Installed uv via the official installer
+Logged into HuggingFace (huggingface-cli login)
+Downloaded the physical-intelligence/libero dataset (~1699 files)
+2. Created a LoRA config
+
+Added pi05_libero_lora to _CONFIGS in src/openpi/training/config.py
+Uses paligemma_variant="gemma_2b_lora" + action_expert_variant="gemma_300m_lora" with ema_decay=None
+Points pytorch_weight_path to the local converted checkpoint
+3. Computed norm stats
+
+
+uv run scripts/compute_norm_stats.py --config-name=pi05_libero_lora
+4. Converted the JAX base checkpoint to PyTorch
+
+
+uv run examples/convert_jax_model_to_pytorch.py \
+    --checkpoint_dir ~/.cache/openpi/.../pi05_base \
+    --config_name pi05_libero_lora \
+    --output_path ~/.cache/openpi/.../pi05_base_pytorch
+(Required copying transformers_replace/ files first)
+
+5. Fixed the PyTorch trainer to freeze the backbone
+
+Modified scripts/train_pytorch.py to detect LoRA configs and freeze paligemma_with_expert.paligemma, reducing optimizer state memory from ~15GB to ~2.4GB
+6. Launched training
+
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+uv run scripts/train_pytorch.py pi05_libero_lora \
+    --exp_name my_pi05_libero_lora --overwrite --batch_size 4
