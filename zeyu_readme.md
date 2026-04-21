@@ -204,3 +204,5 @@ Modified scripts/train_pytorch.py to detect LoRA configs and freeze paligemma_wi
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 uv run scripts/train_pytorch.py pi05_libero_lora \
     --exp_name my_pi05_libero_lora --overwrite --batch_size 4
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run torchrun --standalone --nnodes=1 --nproc_per_node=2     scripts/train_pytorch.py pi05_libero_lora_film     --exp_name my_pi05_libero_film --overwrite --batch_size 16
