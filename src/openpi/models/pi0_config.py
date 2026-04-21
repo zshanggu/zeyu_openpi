@@ -29,6 +29,10 @@ class Pi0Config(_model.BaseModelConfig):
     # - the state input is part of the discrete language tokens rather than a continuous input that is part of the suffix
     # - the action expert uses adaRMSNorm to inject the flow matching timestep
     pi05: bool = False
+    # FiLM-condition every action-expert layer on a pooled language embedding so language
+    # influence is injected unconditionally (cannot be "ignored" by attention).
+    # Only active when pi05=True. Zero-initialised so training starts identical to base model.
+    lang_film: bool = False
     # Repeat the language prompt N times in the prefix to give language more key positions to attend to.
     # Useful for long-horizon tasks where attention to language tokens decays over time.
     prompt_repeat_n: int = 1

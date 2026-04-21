@@ -87,6 +87,7 @@ class PI0Pytorch(nn.Module):
         super().__init__()
         self.config = config
         self.pi05 = config.pi05
+        self.lang_film = config.pi05 and config.lang_film
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -104,6 +105,11 @@ class PI0Pytorch(nn.Module):
         if self.pi05:
             self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
             self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+            if config.lang_film:
+                self.lang_film_proj = nn.Linear(paligemma_config.width, action_expert_config.width)
+                nn.init.zeros_(self.lang_film_proj.weight)
+                nn.init.zeros_(self.lang_film_proj.bias)
+                logging.info("Language FiLM conditioning enabled (lang_film=True)")
         else:
             self.state_proj = nn.Linear(config.action_dim, action_expert_config.width)
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
@@ -187,7 +193,7 @@ class PI0Pytorch(nn.Module):
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
         """
@@ -221,6 +227,13 @@ class PI0Pytorch(nn.Module):
 
         lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
 
+        # Masked mean-pool language embeddings and project to action-expert width for FiLM.
+        film_lang_emb = None
+        if self.lang_film:
+            mask_f = lang_masks.float()  # [B, L]
+            lang_pooled = (lang_emb * mask_f[:, :, None]).sum(1) / mask_f.sum(1, keepdim=True).clamp(min=1.0)
+            film_lang_emb = self.lang_film_proj(lang_pooled)  # [B, action_expert_width]
+
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
 
@@ -240,9 +253,9 @@ class PI0Pytorch(nn.Module):
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
-        return embs, pad_masks, att_masks
+        return embs, pad_masks, att_masks, film_lang_emb
 
-    def embed_suffix(self, state, noisy_actions, timestep):
+    def embed_suffix(self, state, noisy_actions, timestep, lang_emb=None):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
@@ -301,6 +314,9 @@ class PI0Pytorch(nn.Module):
                 return F.silu(x)
 
             time_emb = self._apply_checkpoint(time_mlp_func, time_emb)
+            # FiLM: add projected language embedding so every adaRMS layer is conditioned on language
+            if self.lang_film and lang_emb is not None:
+                time_emb = time_emb + lang_emb
             action_time_emb = action_emb
             adarms_cond = time_emb
 
@@ -335,8 +351,8 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        prefix_embs, prefix_pad_masks, prefix_att_masks, lang_emb = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time, lang_emb)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
@@ -390,7 +406,7 @@ class PI0Pytorch(nn.Module):
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks, lang_emb = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
@@ -444,6 +460,7 @@ class PI0Pytorch(nn.Module):
                     past_key_values,
                     x_t,
                     expanded_time,
+                    lang_emb,
                 )
 
                 # Euler step - use new tensor assignment instead of in-place operation
@@ -470,9 +487,10 @@ class PI0Pytorch(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        lang_emb=None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep, lang_emb)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]

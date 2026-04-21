@@ -67,6 +67,7 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.lang_film = config.pi05 and config.lang_film
         self.prompt_repeat_n = config.prompt_repeat_n
         if self.prompt_repeat_n > 1:
             logger.info("Instruction repetition enabled: prompt_repeat_n=%d", self.prompt_repeat_n)
@@ -96,6 +97,17 @@ class Pi0(_model.BaseModel):
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+            if config.lang_film:
+                # Projects pooled language embedding into action-expert width for FiLM conditioning.
+                # Zero kernel init: at initialisation lang_film_proj outputs zero so training starts
+                # identical to the base pi0.5 and gradually learns to exploit language.
+                self.lang_film_proj = nnx.Linear(
+                    paligemma_config.width,
+                    action_expert_config.width,
+                    kernel_init=nnx.initializers.zeros,
+                    rngs=rngs,
+                )
+                logger.info("Language FiLM conditioning enabled (lang_film=True)")
         else:
             self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -108,7 +120,12 @@ class Pi0(_model.BaseModel):
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation
-    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+    ) -> tuple[
+        at.Float[at.Array, "b s emb"],
+        at.Bool[at.Array, "b s"],
+        at.Bool[at.Array, " s"],
+        at.Float[at.Array, "b emb"] | None,
+    ]:
         input_mask = []
         ar_mask = []
         tokens = []
@@ -127,9 +144,20 @@ class Pi0(_model.BaseModel):
             # image tokens attend to each other
             ar_mask += [False] * image_tokens.shape[1]
 
+        lang_emb = None
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+
+            if self.lang_film:
+                # Masked mean-pool the raw language embeddings (before tiling/transformer)
+                # and project to action-expert width for FiLM conditioning.
+                mask_f = obs.tokenized_prompt_mask.astype(jnp.float32)  # [B, L]
+                lang_pooled = (tokenized_inputs * mask_f[:, :, None]).sum(1) / mask_f.sum(
+                    1, keepdims=True
+                ).clip(min=1.0)  # [B, paligemma_width]
+                lang_emb = self.lang_film_proj(lang_pooled)  # [B, action_expert_width]
+
             if self.prompt_repeat_n > 1:
                 # Repeat the prompt N times in the prefix so action tokens have more
                 # language key positions to attend to (helps long-horizon tasks).
@@ -144,11 +172,15 @@ class Pi0(_model.BaseModel):
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
-        return tokens, input_mask, ar_mask
+        return tokens, input_mask, ar_mask, lang_emb
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+        self,
+        obs: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, " b"],
+        lang_emb: at.Float[at.Array, "b emb"] | None = None,
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
@@ -175,6 +207,9 @@ class Pi0(_model.BaseModel):
             time_emb = nnx.swish(time_emb)
             time_emb = self.time_mlp_out(time_emb)
             time_emb = nnx.swish(time_emb)
+            # FiLM: add projected language embedding so every adaRMS layer is conditioned on language
+            if self.lang_film and lang_emb is not None:
+                time_emb = time_emb + lang_emb
             action_expert_tokens = action_tokens
             adarms_cond = time_emb
         else:
@@ -210,8 +245,8 @@ class Pi0(_model.BaseModel):
         u_t = noise - actions
 
         # one big forward pass of prefix + suffix at once
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+        prefix_tokens, prefix_mask, prefix_ar_mask, lang_emb = self.embed_prefix(observation)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time, lang_emb)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
@@ -241,7 +276,7 @@ class Pi0(_model.BaseModel):
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
         # first fill KV cache with a forward pass of the prefix
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask, lang_emb = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
@@ -249,7 +284,7 @@ class Pi0(_model.BaseModel):
         def step(carry):
             x_t, time = carry
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
+                observation, x_t, jnp.broadcast_to(time, batch_size), lang_emb
             )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other
