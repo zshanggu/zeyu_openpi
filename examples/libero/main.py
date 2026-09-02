@@ -14,6 +14,13 @@ from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
 
+try:
+    # Registers the LiLo-VLA suites (ultra_long, libero_long_plus_plus, ...)
+    # into libero.libero.benchmark's BENCHMARK_MAPPING, if the package is installed.
+    import lilo_vla.benchmark  # noqa: F401
+except ImportError:
+    pass
+
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
 
@@ -67,6 +74,8 @@ def eval_libero(args: Args) -> None:
         max_steps = 520  # longest training demo has 505 steps
     elif args.task_suite_name == "libero_90":
         max_steps = 400  # longest training demo has 373 steps
+    elif args.task_suite_name.startswith("ultra_long"):
+        max_steps = 2400  # LiLo-VLA ultra-long suite: chains up to 16 skills, no reference demos to size against
     else:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
 
@@ -82,7 +91,9 @@ def eval_libero(args: Args) -> None:
         initial_states = task_suite.get_task_init_states(task_id)
 
         # Initialize LIBERO environment and task description
-        env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
+        env, task_description = _get_libero_env(
+            task, LIBERO_ENV_RESOLUTION, args.seed, horizon=max_steps + args.num_steps_wait
+        )
 
         # Start episodes
         task_episodes, task_successes = 0, 0
@@ -166,9 +177,11 @@ def eval_libero(args: Args) -> None:
 
             # Save a replay video of the episode
             suffix = "success" if done else "failure"
-            task_segment = task_description.replace(" ", "_")
+            # Truncate: LiLo-VLA variant suites use full chained-instruction strings as the
+            # task description, which are far longer than the filesystem filename limit.
+            task_segment = task_description.replace(" ", "_")[:80]
             imageio.mimwrite(
-                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
+                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_ep{episode_idx}_{suffix}.mp4",
                 [np.asarray(x) for x in replay_images],
                 fps=10,
             )
@@ -186,11 +199,19 @@ def eval_libero(args: Args) -> None:
     logging.info(f"Total episodes: {total_episodes}")
 
 
-def _get_libero_env(task, resolution, seed):
+def _get_libero_env(task, resolution, seed, horizon=1000):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
     task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
-    env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
+    env_args = {
+        "bddl_file_name": task_bddl_file,
+        "camera_heights": resolution,
+        "camera_widths": resolution,
+        # robosuite's internal episode horizon (default 1000) is independent of task success;
+        # once elapsed timesteps reach it, the *next* env.step() raises rather than just failing
+        # the episode. Must cover the full step budget, including the num_steps_wait warm-up.
+        "horizon": horizon,
+    }
     env = OffScreenRenderEnv(**env_args)
     env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description

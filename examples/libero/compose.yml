@@ -16,6 +16,7 @@ services:
       - $PWD:/app
       - ../../data:/data
       - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      - ${LILO_VLA_HOME:-../../../zeyu-LiLo-VLA}:/lilo-vla
     environment:
       - CLIENT_ARGS
       - DISPLAY=$DISPLAY
