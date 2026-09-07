@@ -61,6 +61,34 @@ Terminal window 2:
 uv run scripts/serve_policy.py --env LIBERO
 ```
 
+## Converting LIBERO data to LeRobot format
+
+Fine-tuning (e.g. `pi05_libero`) needs the data as a LeRobot dataset. Which conversion script
+to use depends on which raw LIBERO data you have:
+
+- **Raw benchmark HDF5 files** (`libero_10`, `libero_90`, `libero_spatial`, `libero_object`,
+  `libero_goal`, e.g. from the original
+  [LIBERO benchmark](https://github.com/Lifelong-Robot-Learning/LIBERO) or a `libero_100.zip`
+  download -- one `*_demo.hdf5` file per task, with `data/demo_N/obs/agentview_rgb` etc.
+  inside): use `convert_libero_hdf5_to_lerobot.py`.
+
+  ```bash
+  uv run examples/libero/convert_libero_hdf5_to_lerobot.py \
+      --data-dir /path/to/libero_90 \
+      --repo-name your_hf_username/libero_90
+  ```
+
+- **RLDS/TFDS re-release** (`openvla/modified_libero_rlds` on Hugging Face, loaded via
+  `tensorflow_datasets`): use `convert_libero_data_to_lerobot.py` (requires
+  `uv pip install tensorflow tensorflow_datasets`).
+
+Both scripts write to `$HF_LEROBOT_HOME` and produce the same `image` / `wrist_image` / `state`
+(8-dim) / `actions` (7-dim) feature schema expected by `LeRobotLiberoDataConfig` in
+`src/openpi/training/config.py` and `LiberoInputs`/`LiberoOutputs` in
+`src/openpi/policies/libero_policy.py`. Point your `TrainConfig`'s `repo_id` at whatever
+`--repo-name` you chose, then compute norm stats and train as described in the top-level
+[README](../../README.md#fine-tuning-base-models-on-your-own-data).
+
 ## Results
 
 If you want to reproduce the following numbers, you can evaluate the checkpoint at `gs://openpi-assets/checkpoints/pi05_libero/`. This
