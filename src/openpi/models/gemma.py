@@ -159,6 +159,9 @@ class Attention(nn.Module):
     """Attention module."""
 
     configs: Sequence[Config]
+    # When True, also return the post-softmax attention weights (probs), shape
+    # [B, K, G, T, S]. Static/construction-time only -- see Module.capture_attn.
+    capture_attn: bool = False
 
     @nn.compact
     def __call__(self, xs, positions, attn_mask, kv_cache):
@@ -246,6 +249,8 @@ class Attention(nn.Module):
             else:
                 out.append(None)
 
+        if self.capture_attn:
+            return out, (k, v), probs
         return out, (k, v)
 
 
@@ -288,13 +293,21 @@ class Block(nn.Module):
 
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()
+    # When True, also return the stacked per-layer attention weights as a second
+    # element bundled alongside kv_cache -- i.e. (xs, (kv_cache, probs)) instead
+    # of (xs, kv_cache). This is a static, construction-time-only flag (see
+    # Module.capture_attn); flax's nn.scan requires every non-carry output to be
+    # bundled into a single pytree in the second return slot when there's more
+    # than one, so kv_cache and probs must travel together here rather than as
+    # separate top-level tuple elements.
+    capture_attn: bool = False
 
     @nn.compact
     def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
-        attn = Attention(configs=self.configs, name="attn")
+        attn = Attention(configs=self.configs, capture_attn=self.capture_attn, name="attn")
 
         pre_attn = []
         gates = []
@@ -305,7 +318,10 @@ class Block(nn.Module):
             gates.append(gate if x is not None else None)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
+        if self.capture_attn:
+            post_attn, kv_cache, attn_probs = attn(pre_attn, positions, attn_mask, kv_cache)
+        else:
+            post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]
@@ -330,6 +346,8 @@ class Block(nn.Module):
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
         xs = sharding.activation_sharding_constraint(xs)
 
+        if self.capture_attn:
+            return xs, (kv_cache, attn_probs)
         return xs, kv_cache
 
 
@@ -346,6 +364,13 @@ class Module(nn.Module):
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()  # Every float is dropped independently.
     adarms: bool = False
+    # When True, `self.layers` is built so each Block also emits its attention
+    # weights, retrievable via `forward_with_attn` (not `__call__`, which is
+    # unaffected). Static/construction-time only: build a second instance of
+    # this Module with `dataclasses.replace(module, capture_attn=True)` and
+    # reapply the same trained params to it, rather than flipping this on an
+    # existing instance -- see Pi0.sample_actions_with_attention.
+    capture_attn: bool = False
 
     def setup(self):
         # all experts must have the same depth
@@ -378,6 +403,7 @@ class Module(nn.Module):
             configs=self.configs,
             dropout=self.dropout,
             dropout_bdims=self.dropout_bdims,
+            capture_attn=self.capture_attn,
         )
         self.final_norms = [RMSNorm(name=_name("final_norm", i)) for i in range(len(self.configs))]
 
@@ -409,6 +435,44 @@ class Module(nn.Module):
         return [
             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
         ], kv_cache
+
+    @at.typecheck
+    def forward_with_attn(
+        self,
+        embedded: Sequence[at.Float[at.Array, "b _t _d"] | None],
+        positions: at.Int[at.Array, "b t"],
+        mask: at.Bool[at.Array, "b t s"],
+        adarms_cond: Sequence[at.Float[at.Array, "b _d"] | None] | None = None,
+        *,
+        kv_cache: KVCache | None = None,
+        deterministic: bool = True,
+    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache, at.Array]:
+        """Like `__call__`, but also returns the stacked per-layer attention weights
+        (shape [depth, b, num_kv_heads, num_query_heads_per_kv_head, t, s]).
+
+        Only valid on a Module instance constructed with `capture_attn=True` --
+        see the `capture_attn` field docstring. Calling this on a normal
+        (capture_attn=False) instance will raise, since `self.layers` won't have
+        been built to emit the extra output.
+        """
+        if not self.capture_attn:
+            raise ValueError(
+                "forward_with_attn() requires a Module built with capture_attn=True; "
+                "this instance has capture_attn=False. See Pi0.sample_actions_with_attention."
+            )
+        embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
+        mask = jnp.asarray(mask)[:, None, :, :]
+        if adarms_cond is None:
+            adarms_cond = [None] * len(self.configs)
+
+        embedded, (kv_cache, attn) = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
+
+        assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
+
+        outputs = [
+            f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
+        ]
+        return outputs, kv_cache, attn
 
     def init(self, use_adarms: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""

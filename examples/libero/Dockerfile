@@ -59,4 +59,7 @@ EOF
 
 RUN mkdir -p /usr/share/glvnd/egl_vendor.d && echo '{"file_format_version" : "1.0.0", "ICD" : { "library_path" : "libEGL_nvidia.so.0" }}' > /usr/share/glvnd/egl_vendor.d/10_nvidia.json
 
-CMD ["/bin/bash", "-c", "source /.venv/bin/activate && if [ -f /lilo-vla/pyproject.toml ]; then uv pip install -e /lilo-vla; fi && python examples/libero/main.py $CLIENT_ARGS"]
+# CLIENT_SCRIPT lets you swap in a different client script (e.g.
+# examples/libero/visualize_attention.py) without rebuilding; defaults to the
+# standard main.py.
+CMD ["/bin/bash", "-c", "source /.venv/bin/activate && if [ -f /lilo-vla/pyproject.toml ]; then uv pip install -e /lilo-vla; fi && python ${CLIENT_SCRIPT:-examples/libero/main.py} $CLIENT_ARGS"]

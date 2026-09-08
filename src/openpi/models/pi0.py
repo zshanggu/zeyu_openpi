@@ -1,8 +1,10 @@
+import dataclasses
 import logging
 
 import einops
 import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
+from flax.nnx.bridge import variables as _bridge_variables
 import jax
 import jax.numpy as jnp
 from typing_extensions import override
@@ -277,3 +279,114 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    def _llm_with_attn(self):
+        """Builds a "twin" of self.PaliGemma.llm's underlying Linen module with
+        capture_attn=True baked in, sharing the exact same (already-trained)
+        params, so it can be called via `.apply(..., method="forward_with_attn")`
+        to also get attention weights out. See `gemma.Module.capture_attn`.
+
+        This never touches `self.PaliGemma.llm` itself, so the normal
+        `compute_loss`/`sample_actions` call paths are completely unaffected.
+        """
+        original = self.PaliGemma.llm.module
+        twin = dataclasses.replace(original, capture_attn=True)
+        nnx_attrs = {name: getattr(self.PaliGemma.llm, name) for name in self.PaliGemma.llm.linen_attributes}
+        variables = _bridge_variables.nnx_attrs_to_linen_vars(nnx_attrs)
+        return twin, variables
+
+    def sample_actions_with_attention(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+    ) -> tuple[_model.Actions, at.Array, int]:
+        """Like `sample_actions`, but also returns the action-expert's attention
+        over the prefix (image + language tokens) from the *last* flow-matching
+        denoising step.
+
+        Diagnostic/visualization use only -- not used by training or the
+        standard eval path. Returns:
+          - actions: same as `sample_actions`.
+          - attn: attention weights from the final denoising step, shape
+            [depth, b, num_kv_heads, num_query_heads_per_kv_head, suffix_len,
+            prefix_len + suffix_len]. Averaging over the leading two head axes
+            and slicing key-columns [prefix_len - language_len : prefix_len]
+            gives per-language-token attention for each of the `suffix_len`
+            query rows (state token if present, then the action_horizon steps).
+          - prefix_len: number of key/value columns in `attn` that belong to
+            the prefix (images + language) -- language occupies the last
+            `observation.tokenized_prompt.shape[1]` of those columns.
+
+        `num_steps` must be a concrete Python int here (unlike `sample_actions`,
+        which also accepts a traced array): capturing every denoising step
+        would require rewriting the flow-matching loop from `lax.while_loop` to
+        `lax.scan` (while_loop has no mechanism to stack per-iteration outputs,
+        only to carry a fixed-shape value to the next iteration -- discovered
+        empirically while implementing this), so instead this carries the
+        latest step's attention forward and returns whichever step happened to
+        be last, which requires a statically-known number of iterations.
+        """
+        observation = _model.preprocess_observation(None, observation, train=False)
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        llm_twin, llm_variables = self._llm_with_attn()
+
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_len = prefix_tokens.shape[1]
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache, _ = llm_twin.apply(
+            llm_variables, [prefix_tokens, None], positions, prefix_attn_mask, method="forward_with_attn"
+        )
+
+        # Precompute the exact shape/dtype of one step's attention array analytically
+        # (rather than via an extra warmup forward pass), so it can seed the
+        # while_loop's carry -- lax.while_loop requires the carry's pytree
+        # structure/shapes to be fixed across iterations.
+        suffix_tokens_probe, _, _, _ = self.embed_suffix(observation, noise, jnp.ones((batch_size,)))
+        suffix_len = suffix_tokens_probe.shape[1]
+        num_kv_heads = llm_twin.configs[0].num_kv_heads
+        num_query_heads = llm_twin.configs[0].num_heads
+        depth = llm_twin.configs[0].depth
+        attn_shape = (depth, batch_size, num_kv_heads, num_query_heads // num_kv_heads, suffix_len, prefix_len + suffix_len)
+        # probs is cast to the model's compute dtype inside Attention.__call__ (e.g.
+        # bfloat16), not necessarily float32 -- match it so the while_loop carry's
+        # dtype is consistent across iterations.
+        initial_attn = jnp.zeros(attn_shape, dtype=jnp.dtype(llm_twin.embed_dtype))
+
+        def step(carry):
+            x_t, time, _last_attn = carry
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_t, jnp.broadcast_to(time, batch_size)
+            )
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn_mask_b = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([prefix_attn_mask_b, suffix_attn_mask], axis=-1)
+            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+
+            (prefix_out, suffix_out), _, attn = llm_twin.apply(
+                llm_variables,
+                [None, suffix_tokens],
+                positions,
+                full_attn_mask,
+                [None, adarms_cond],
+                kv_cache=kv_cache,
+                method="forward_with_attn",
+            )
+            assert prefix_out is None
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+            return x_t + dt * v_t, time + dt, attn
+
+        def cond(carry):
+            _x_t, time, _attn = carry
+            return time >= -dt / 2
+
+        x_0, _, last_attn = jax.lax.while_loop(cond, step, (noise, 1.0, initial_attn))
+        return x_0, last_attn, prefix_len

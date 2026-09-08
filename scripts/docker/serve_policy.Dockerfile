@@ -35,4 +35,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY src/openpi/models_pytorch/transformers_replace/ /tmp/transformers_replace/
 RUN /.venv/bin/python -c "import transformers; print(transformers.__file__)" | xargs dirname | xargs -I{} cp -r /tmp/transformers_replace/* {} && rm -rf /tmp/transformers_replace
 
-CMD /bin/bash -c "uv run scripts/serve_policy.py $SERVER_ARGS"
+# SERVER_SCRIPT lets you swap in a different serving script (e.g.
+# scripts/serve_policy_with_attention.py) without rebuilding; defaults to the
+# standard serve_policy.py.
+CMD /bin/bash -c "uv run ${SERVER_SCRIPT:-scripts/serve_policy.py} $SERVER_ARGS"

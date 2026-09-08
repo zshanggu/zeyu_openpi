@@ -91,8 +91,11 @@ robosuite==1.4.1
     # via -r examples/libero/requirements.in
 scipy==1.10.1
     # via robosuite
+sentencepiece==0.1.99
+    # via -r examples/libero/requirements.in
 setuptools==74.1.2
     # via
+    #   -r examples/libero/requirements.in
     #   imageio-ffmpeg
     #   numba
 shtab==1.7.1

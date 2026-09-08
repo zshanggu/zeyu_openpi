@@ -9,5 +9,9 @@ torchvision==0.12.0+cu113
 torchaudio==0.11.0+cu113
 robosuite==1.4.1
 matplotlib==3.5.3
+# Used by visualize_attention.py to re-tokenize prompts client-side. Pinned below
+# 0.2.0 (which the root pyproject.toml uses) since 0.2.0+ requires Python >=3.9,
+# incompatible with this Python 3.8 venv.
+sentencepiece==0.1.99
 # setuptools>=75 dropped Python 3.8 support and breaks building robomimic (this venv is Python 3.8).
 setuptools<75
