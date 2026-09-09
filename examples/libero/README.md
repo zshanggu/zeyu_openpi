@@ -89,6 +89,77 @@ Both scripts write to `$HF_LEROBOT_HOME` and produce the same `image` / `wrist_i
 `--repo-name` you chose, then compute norm stats and train as described in the top-level
 [README](../../README.md#fine-tuning-base-models-on-your-own-data).
 
+## Splitting long-horizon demos into sub-skills
+
+LIBERO-10 ("libero-long")'s tasks are each really 2-4 short sub-skills back to back (e.g. "pick
+up the alphabet soup" / "place the alphabet soup in the basket" / "pick up the cream cheese box"
+/ "place the cream cheese box in the basket"). Two scripts turn a directory of raw HDF5 files
+into a LeRobot dataset of those sub-skills as separate, short-instruction episodes instead of one
+long-instruction episode per demo:
+
+1. **`annotate_subskill_boundaries.py`** -- for every demo, finds which frames belong to which
+   sub-skill and writes `subskill_boundaries.json` next to the HDF5 files. Boundaries come from
+   LIBERO's own task-success machinery, not a hand-rolled heuristic: "place"/"open"/"close"/"turn
+   on" boundaries reuse the exact BDDL predicate classes LIBERO's `_check_success()` evaluates
+   every step; "pick up" boundaries use gripper-object contact plus a real height rise (robosuite
+   provides this style of check for its own tasks' reward shaping, e.g. `_check_grasp`, though
+   this script uses the plainer contact+lift version -- see the script's docstring for why).
+   Requires the LIBERO env (Python 3.8 + robosuite + mujoco, no GPU/rendering needed since it
+   only replays recorded states for physics, not images):
+
+   ```bash
+   python examples/libero/annotate_subskill_boundaries.py \
+       --data-dir /path/to/libero_10 \
+       --out /path/to/libero_10/subskill_boundaries.json
+   ```
+
+   `--task-set` selects which sub-skill taxonomy/source-file mapping to use (default
+   `libero_10`, the tasks above). `--task-set libero_90_lilo22` instead annotates
+   [LiLo-VLA](https://yy-gx.github.io/LiLo-VLA/static/pdfs/appendix.pdf)'s 22-skill atomic
+   library (its Table III), mapped onto 13 real LIBERO-90 HDF5 files rather than LIBERO-10's --
+   LIBERO-90's tasks are already short/atomic (one pick + one place, or a single open/close/
+   turn-on), so none of them need LIBERO-10's "transport" padding skill; a file just gets as many
+   sub-skills as it genuinely has (1 or 2):
+
+   ```bash
+   python examples/libero/annotate_subskill_boundaries.py \
+       --task-set libero_90_lilo22 \
+       --data-dir /path/to/libero_90 \
+       --out /path/to/libero_90/subskill_boundaries.json
+   ```
+
+   Every boundary is resolved to a concrete frame range even when detection genuinely can't find
+   a signal (e.g. a demo's recording ends before any visible sign of release) -- those get a
+   `detection_failed: true` flag rather than a silent wrong guess, so treat that sub-skill's cut
+   point as an approximation, not a precise one.
+
+   You can visualize the result with [hdf5-lerobot-visualizer](../../../hdf5-lerobot-visualizer)
+   (a separate Qt GUI project): opening a directory that has a `subskill_boundaries.json` next to
+   its HDF5 files shows a colored timeline of the 4 sub-skills alongside the video, a label for
+   whichever sub-skill the current frame belongs to, and matching shaded regions on the
+   trajectory-signal plot.
+
+2. **`convert_libero_subskills_to_lerobot.py`** -- does the actual cutting, using the JSON from
+   step 1. Each sub-skill segment becomes its own LeRobot episode, labeled with that sub-skill's
+   short prompt instead of the demo's full instruction. Runs in the openpi (JAX/LeRobot) env, not
+   the LIBERO one:
+
+   ```bash
+   uv run examples/libero/convert_libero_subskills_to_lerobot.py \
+       --data-dir /path/to/libero_10 \
+       --repo-name your_hf_username/libero_10_subskills
+   ```
+
+   Since a sub-skill segment's end is usually an artificial mid-demo cut (not the original
+   episode's natural end), its last few real frames would otherwise come up short of a full
+   `action_horizon`-length training target. The script pads every segment's end with `--pad-steps`
+   (default 10, matching `pi05_libero`'s `action_horizon`) no-op frames: repeated last
+   image/state (nothing moves) and a "stay put" action, which differs by action representation
+   (`--action-type`, default `delta` -- matches this dataset, confirmed against the raw actions
+   array in `convert_libero_hdf5_to_lerobot.py`'s docstring): zero pose-delta with the gripper
+   channel held at its last commanded value for `delta`, vs. the entire last action repeated
+   verbatim for `absolute`. See the script's docstring for the full reasoning.
+
 ## Visualizing prompt attention
 
 `visualize_attention.py` runs one LIBERO episode and renders five panels side-by-side, written out

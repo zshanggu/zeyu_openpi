@@ -10,6 +10,7 @@ from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
+from lerobot.common.constants import HF_LEROBOT_HOME
 from typing_extensions import override
 import tyro
 
@@ -556,6 +557,12 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+# Repo id for the LiLo-VLA 22-skill LIBERO-90 subskills dataset (see
+# examples/libero/convert_libero_subskills_to_lerobot.py --task-set
+# libero_90_lilo22). Referenced by both `repo_id` and the norm-stats
+# `assets_dir` below so they can't drift apart.
+_LIBERO_90_LILO22_REPO_ID = "your_hf_username/libero_90_lilo22_subskills"
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -759,6 +766,62 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        # LoRA fine-tuning for constrained hardware (e.g. 2x RTX 4090, 24GB
+        # each): per the Requirements table in the top-level README, LoRA
+        # fine-tuning fits on a single RTX 4090 (>22.5GB) while full
+        # fine-tuning needs >70GB (A100/H100) -- full fine-tuning is not a
+        # realistic option on this hardware. This must go through the JAX
+        # training path (scripts/train.py), not scripts/train_pytorch.py --
+        # the PyTorch reimplementation doesn't support LoRA or FSDP at all
+        # (see the "PyTorch Support" section of the README).
+        name="pi05_libero_90_lilo22_low_mem_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            # Replace with whatever --repo-name you actually gave
+            # convert_libero_subskills_to_lerobot.py when converting
+            # libero_100/libero_90 (default suggested there was
+            # your_hf_username/libero_90_lilo22_subskills).
+            repo_id=_LIBERO_90_LILO22_REPO_ID,
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            # Write/read norm stats directly under the dataset's own
+            # meta/ directory (alongside its tasks.jsonl/episodes.jsonl/
+            # info.json) instead of the default ./assets/<config_name>/
+            # tree -- HF_LEROBOT_HOME is read from the env var of the SAME
+            # name at import time, so this follows whatever
+            # $HF_LEROBOT_HOME you have exported when you run each script.
+            assets=AssetsConfig(
+                assets_dir=str(HF_LEROBOT_HOME / _LIBERO_90_LILO22_REPO_ID),
+                asset_id="meta",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        # See pi0_libero_low_mem_finetune above: the freeze filter must use
+        # the exact same LoRA variant args as `model` above.
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning (matches the other low_mem_finetune configs).
+        ema_decay=None,
+        # A conservative starting point for 24GB cards -- the frozen base
+        # weights (~2.3B params, bf16) alone are ~4.6GB, comfortably fitting
+        # a single RTX 4090 even before LoRA-adapter/activation memory, so
+        # this batch size (split across your 2 GPUs by ordinary JAX data
+        # parallelism -- ordinary data parallelism, no fsdp_devices change
+        # needed for memory here) has real headroom; raise it if you have
+        # spare memory, lower it if you hit an OOM.
+        batch_size=32,
         num_train_steps=30_000,
     ),
     #

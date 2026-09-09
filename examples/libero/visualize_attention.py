@@ -77,14 +77,29 @@ class Args:
     # word position: same scene, same dynamics, differently-worded instruction.
     prompt_override: str | None = None
 
-    # Must match the served model's tokenizer max length (48 for the standard
-    # pi0/pi05 configs) -- the client re-tokenizes the prompt itself to recover
-    # word boundaries, so it needs to pad/mask identically to the server.
-    max_token_len: int = 48
+    # Only used to build the client's OWN local re-tokenization (to recover
+    # word boundaries/columns) -- the language-block slice into `attn` itself
+    # now always uses the server-reported `lang_len`, not this value, so a
+    # mismatch here is harmless as long as it's >= the real prompt's token
+    # count (real tokens always land at the start of the padded block
+    # regardless of total width). The model's *actual* configured value (48
+    # for pi0, 200 for pi0.5 -- see max_token_len in
+    # src/openpi/models/pi0_config.py) only matters if you set this LOWER
+    # than the real prompt's token count, which would truncate it.
+    max_token_len: int = 200
 
     seed: int = 7
     video_out_path: str = "data/libero/attention_videos"
     tokenizer_cache_dir: str = "data/libero/.tokenizer_cache"
+
+    # Per-inference-call chatter ("Requesting inference...", "Got action chunk
+    # back...") and the raw per-word/per-layer attention value dump (see
+    # log_word_attention) -- off by default since a full episode logs one of
+    # these blocks (18 layers x N words) every `--args.replan-steps` env
+    # steps, which floods the console. Turn on when actually inspecting the
+    # numbers (e.g. checking whether a flat-looking heatmap is truly constant
+    # or just too small to see -- see log_word_attention's docstring).
+    verbose: bool = False
 
     # Alpha-blend strength for the image-attention heatmap overlays (0=invisible,
     # 1=heatmap only, no underlying camera frame).
@@ -190,6 +205,38 @@ def group_tokens_into_words(
         current_cols.append(col)
     flush()
     return words
+
+
+def log_word_attention(step: int, words: list[str], word_attn: np.ndarray, lang_mass_pct: float) -> None:
+    """Logs the RAW per-word attention values (the same numbers the heatmaps
+    render, before render_attention_heatmap's per-row relative renormalization
+    -- see that function's docstring for why the renormalization exists: raw
+    values are a tiny slice of an 800+-position softmax, so plain min/max
+    color scaling makes real variation look flat to the eye even when it's
+    not zero). Printing the numbers directly answers a different question
+    than the heatmap does: is a visually-flat row *actually* constant, or is
+    it real-but-small variation that a straight color scale just can't show
+    -- read the per-layer min/max/std below rather than eyeballing the raw
+    values list.
+    """
+    # Scientific notation, not fixed-decimal: with only ~800+ prefix positions
+    # sharing one softmax, a real (non-bug) per-word share can legitimately be
+    # small enough that even 6 decimal places -- or 4 decimal places on the
+    # percentage -- prints as a deceptive "0.000000"/"0.0000%" whether the
+    # true value is 1e-5 or 1e-30. Scientific notation shows the actual
+    # magnitude either way, which is the whole point of this log: telling
+    # "genuinely tiny" apart from "exactly zero, likely a real bug".
+    logging.info(
+        f"[step {step}] Raw per-word language attention (language mass: {lang_mass_pct:.6e}% of total). "
+        f"Words: {words}"
+    )
+    for i in range(word_attn.shape[0]):
+        row = word_attn[i]
+        values_str = ", ".join(f"{v:.6e}" for v in row)
+        logging.info(
+            f"  layer{i:>2}: [{values_str}]  "
+            f"(min={row.min():.6e} max={row.max():.6e} range={row.max() - row.min():.6e} std={row.std():.6e})"
+        )
 
 
 def render_attention_heatmap(
@@ -417,9 +464,11 @@ def main(args: Args) -> None:
                     "prompt": str(task_description),
                 }
 
-                logging.info(f"Requesting inference from server (step {t})...")
+                if args.verbose:
+                    logging.info(f"Requesting inference from server (step {t})...")
                 result = client.infer(element)
-                logging.info("Got action chunk back from server.")
+                if args.verbose:
+                    logging.info("Got action chunk back from server.")
                 action_chunk = result["actions"]
                 assert len(action_chunk) >= args.replan_steps, (
                     f"We want to replan every {args.replan_steps} steps, "
@@ -436,8 +485,21 @@ def main(args: Args) -> None:
                 # informative axis to show than which step does.
                 attn_all_layers = result["attn"]  # [depth, suffix_len, prefix_len + suffix_len]
                 prefix_len = result["prefix_len"]
-                attn_lang = attn_all_layers[:, :, prefix_len - lang_len : prefix_len]  # [depth, suffix_len, lang_len]
-                attn_lang_per_layer = attn_lang.mean(axis=1)  # -> [depth, lang_len]
+                # Use the SERVER's reported language-block width, not the
+                # client's own `lang_len` (from its local re-tokenization) --
+                # the language block in the prefix is the model's configured
+                # max_token_len (48 for pi0, 200 for pi0.5), padded, not just
+                # the real token count, and the client has no way to know
+                # which one the server is actually running. Getting this
+                # wrong doesn't crash: it silently slices into the wrong
+                # columns (e.g. padding, which reads back as an exact zero,
+                # not a small-but-real value) -- confirmed as the actual
+                # cause of an earlier "language attention is all zero" report
+                # (server was pi05_libero, max_token_len=200; client assumed
+                # the pi0 default of 48).
+                attn_lang_len = result.get("lang_len", lang_len)
+                attn_lang = attn_all_layers[:, :, prefix_len - attn_lang_len : prefix_len]  # [depth, suffix_len, L]
+                attn_lang_per_layer = attn_lang.mean(axis=1)  # -> [depth, attn_lang_len]
 
                 if words_with_cols:
                     words = [w for w, _ in words_with_cols]
@@ -453,6 +515,8 @@ def main(args: Args) -> None:
                 # you whether the model attends to language much at all in
                 # absolute terms (see render_attention_heatmap's docstring).
                 lang_mass_pct = float(attn_lang_per_layer.sum(axis=-1).mean()) * 100
+                if args.verbose:
+                    log_word_attention(t, words, word_attn, lang_mass_pct)
 
                 row_labels = [f"layer{i}" for i in range(word_attn.shape[0])]
                 value_heatmap_frame = render_attention_heatmap(
@@ -487,7 +551,7 @@ def main(args: Args) -> None:
                         f"patches_per_camera={patches_per_camera} is not a perfect square "
                         f"(got side {grid_side})"
                     )
-                    attn_img_all = attn_all_layers[:, :, :prefix_len - lang_len]  # [depth, suffix_len, num_img_cols]
+                    attn_img_all = attn_all_layers[:, :, : prefix_len - attn_lang_len]  # [depth, suffix_len, num_img_cols]
 
                     def _camera_grid(camera_name: str) -> np.ndarray | None:
                         if camera_name not in camera_names:

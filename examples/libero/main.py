@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import collections
 import dataclasses
 import logging
@@ -41,6 +43,7 @@ class Args:
     task_suite_name: str = (
         "libero_spatial"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
+    task_id: int | None = None  # If set, only evaluate this one task index instead of every task in the suite.
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
 
@@ -81,9 +84,13 @@ def eval_libero(args: Args) -> None:
 
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
 
+    if args.task_id is not None and not (0 <= args.task_id < num_tasks_in_suite):
+        raise ValueError(f"task_id {args.task_id} out of range for {args.task_suite_name} (0-{num_tasks_in_suite - 1})")
+    task_ids = [args.task_id] if args.task_id is not None else range(num_tasks_in_suite)
+
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    for task_id in tqdm.tqdm(task_ids):
         # Get task
         task = task_suite.get_task(task_id)
 

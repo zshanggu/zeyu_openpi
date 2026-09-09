@@ -5,6 +5,8 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
+import pathlib
+
 import numpy as np
 import tqdm
 import tyro
@@ -108,7 +110,15 @@ def main(config_name: str, max_frames: int | None = None):
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    # Mirrors DataConfigFactory._load_norm_stats's own resolution exactly (see
+    # openpi/training/config.py) so this always writes to wherever training
+    # will actually look for it: AssetsConfig.assets_dir overrides the
+    # default ./assets/<config_name> tree (e.g. to instead write directly
+    # under a LeRobot dataset's own meta/ directory), and asset_id overrides
+    # which subdirectory under that holds this dataset's stats (defaults to
+    # the repo_id if not set).
+    assets_dir = pathlib.Path(config.data.assets.assets_dir) if config.data.assets.assets_dir else config.assets_dirs
+    output_path = assets_dir / data_config.asset_id
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

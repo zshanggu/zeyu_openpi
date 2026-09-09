@@ -47,8 +47,8 @@ class AttentionCapturingPolicy(_policy.Policy):
         axis spans the full prefix (images + language) followed by the suffix
         itself. The client picks which layer(s) to look at.
       - prefix_len: int, number of columns in `attn`'s last axis that belong to
-        the prefix. The language tokens are its last `len(prompt_tokens)`
-        columns (the client re-tokenizes the prompt itself to know how many).
+        the prefix. The language block is its last `lang_len` columns (see
+        below) -- use that field, not a client-side guess, to slice it out.
       - camera_names: list[str], the camera keys in `observation.images` in the
         same order `embed_prefix` concatenates their patch tokens into the
         prefix -- i.e. `attn`'s columns `[0:patches_per_camera]` belong to
@@ -57,6 +57,15 @@ class AttentionCapturingPolicy(_policy.Policy):
       - patches_per_camera: int, number of visual patch tokens contributed by
         each camera (all cameras share one resolution/encoder, so this is the
         same for all of them).
+      - lang_len: int, width of the language block (the model's configured
+        max_token_len -- 48 for pi0, 200 for pi0.5), i.e. `attn`'s columns
+        `[prefix_len - lang_len : prefix_len]`. This is padded (right-padded
+        with masked-out positions past the real token count), not just the
+        real token count, so the client must use this exact value for its
+        slice rather than re-deriving one from its own re-tokenization of the
+        prompt -- getting it wrong doesn't crash, it silently slices into the
+        wrong columns (e.g. padding, which reads back as a hard zero, not a
+        small-but-real value).
     """
 
     def __init__(self, *args: Any, num_denoising_steps: int = 10, **kwargs: Any):
@@ -111,6 +120,15 @@ class AttentionCapturingPolicy(_policy.Policy):
         lang_len = int(inputs["tokenized_prompt"].shape[-1])
         outputs["camera_names"] = camera_names
         outputs["patches_per_camera"] = (int(prefix_len) - lang_len) // len(camera_names)
+        # The client re-tokenizes the prompt itself and needs to know exactly
+        # how many of attn's trailing prefix columns are language columns to
+        # slice them out correctly -- this is the model's configured
+        # max_token_len (48 for pi0, 200 for pi0.5), which the client has no
+        # way to know on its own. Getting this wrong doesn't crash anything;
+        # it silently slices into the wrong columns (e.g. padding, which is
+        # masked to a hard zero), so this must not be left for the client to
+        # guess via its own --args.max-token-len default.
+        outputs["lang_len"] = lang_len
         # The client can't otherwise tell whether attn's suffix_len includes a
         # leading state-token row (pi0) or not (pi0.5, self._model.pi05) -- it
         # has no access to the model config to infer this itself.

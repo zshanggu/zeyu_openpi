@@ -20,6 +20,8 @@ fonttools==4.55.3
     # via matplotlib
 glfw==1.12.0
     # via mujoco
+h5py==3.11.0
+    # via -r examples/libero/requirements.in
 idna==3.10
     # via requests
 imageio==2.35.1
@@ -47,6 +49,7 @@ numba==0.53.1
 numpy==1.22.4
     # via
     #   -r examples/libero/requirements.in
+    #   h5py
     #   imageio
     #   matplotlib
     #   mujoco
