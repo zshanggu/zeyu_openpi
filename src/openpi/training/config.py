@@ -10,7 +10,6 @@ from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
-from lerobot.common.constants import HF_LEROBOT_HOME
 from typing_extensions import override
 import tyro
 
@@ -70,6 +69,12 @@ class DataConfig:
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
     norm_stats: dict[str, _transforms.NormStats] | None = None
+    # If set, the LeRobot dataset is loaded directly from this local directory (passed as
+    # LeRobotDataset's own `root` argument) instead of resolving repo_id under $HF_LEROBOT_HOME.
+    # Norm stats are then also read/written directly under `<local_root>/meta/` to match, instead
+    # of the separate ./assets/<config_name>/ tree -- see DataConfigFactory.create_base_config and
+    # scripts/compute_norm_stats.py.
+    local_root: str | None = None
 
     # Used to adopt the inputs from a dataset specific format to a common format
     # which is expected by the data transforms.
@@ -172,6 +177,14 @@ class DataConfigFactory(abc.ABC):
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
     base_config: tyro.conf.Suppress[DataConfig | None] = None
+    # If set, load the LeRobot dataset directly from this local directory instead of resolving
+    # repo_id under $HF_LEROBOT_HOME, and read/write norm stats directly under
+    # <local_root>/meta/ instead of the separate ./assets/<config_name>/ tree -- one single path,
+    # passed the same way to the converter script, compute_norm_stats.py, and train.py (as
+    # --output-dir / --local-root / --data.local-root), rather than juggling repo_id +
+    # $HF_LEROBOT_HOME. See DataConfig.local_root, data_loader.create_torch_dataset, and
+    # scripts/compute_norm_stats.py.
+    local_root: str | None = None
 
     @abc.abstractmethod
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -180,11 +193,18 @@ class DataConfigFactory(abc.ABC):
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
         asset_id = self.assets.asset_id or repo_id
+        if self.local_root is not None:
+            # local_root fixes both where the dataset itself lives AND where its norm stats
+            # live (its own meta/ subdirectory), overriding any separate AssetsConfig.
+            norm_stats_dir, asset_id = epath.Path(self.local_root), "meta"
+        else:
+            norm_stats_dir = epath.Path(self.assets.assets_dir or assets_dirs)
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
             asset_id=asset_id,
-            norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
+            local_root=self.local_root,
+            norm_stats=self._load_norm_stats(norm_stats_dir, asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
 
@@ -557,12 +577,6 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
-# Repo id for the LiLo-VLA 22-skill LIBERO-90 subskills dataset (see
-# examples/libero/convert_libero_subskills_to_lerobot.py --task-set
-# libero_90_lilo22). Referenced by both `repo_id` and the norm-stats
-# `assets_dir` below so they can't drift apart.
-_LIBERO_90_LILO22_REPO_ID = "your_hf_username/libero_90_lilo22_subskills"
-
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -786,23 +800,29 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotLiberoDataConfig(
-            # Replace with whatever --repo-name you actually gave
-            # convert_libero_subskills_to_lerobot.py when converting
-            # libero_100/libero_90 (default suggested there was
-            # your_hf_username/libero_90_lilo22_subskills).
-            repo_id=_LIBERO_90_LILO22_REPO_ID,
+            # repo_id is just an internal identifier here (no $HF_LEROBOT_HOME lookup happens
+            # when local_root is set below) -- doesn't need to match a real HF Hub namespace.
+            repo_id="libero_90_lilo22_subskills",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
-            # Write/read norm stats directly under the dataset's own
-            # meta/ directory (alongside its tasks.jsonl/episodes.jsonl/
-            # info.json) instead of the default ./assets/<config_name>/
-            # tree -- HF_LEROBOT_HOME is read from the env var of the SAME
-            # name at import time, so this follows whatever
-            # $HF_LEROBOT_HOME you have exported when you run each script.
-            assets=AssetsConfig(
-                assets_dir=str(HF_LEROBOT_HOME / _LIBERO_90_LILO22_REPO_ID),
-                asset_id="meta",
-            ),
+            # Hardcoded default (update if you re-convert to a different location) rather than
+            # None: unlike compute_norm_stats.py and train.py (which support --local-root /
+            # --data.local-root overrides via tyro.extras.overridable_config_cli), serve_policy.py
+            # has NO per-field CLI override mechanism at all -- Checkpoint.config is just a plain
+            # string looked up via _config.get_config(), so there's no way to pass an override at
+            # serve time. This value itself is never actually read when serving (norm stats are
+            # loaded from checkpoint_dir/assets/<asset_id>, not from local_root), but local_root
+            # being non-None is what makes asset_id resolve to "meta" (see
+            # DataConfigFactory.create_base_config) instead of repo_id -- matching how every
+            # checkpoint saved during training bundled its norm stats (also under assets/meta/,
+            # for the same reason). If this were left as None, serve_policy.py would look for
+            # assets/libero_90_lilo22_subskills/norm_stats.json instead of assets/meta/norm_stats.json
+            # and fail with a FileNotFoundError (confirmed: this exact mismatch happened before
+            # this default was set).
+            #
+            # You can still override this for compute_norm_stats.py/train.py with
+            # --local-root / --data.local-root pointing at wherever you actually converted to.
+            local_root="/data/zeyu/PHD_LAB/Amazon_Project/lerobot_datasets/your_hf_username/libero_90_lilo22_subskills",
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         # See pi0_libero_low_mem_finetune above: the freeze filter must use

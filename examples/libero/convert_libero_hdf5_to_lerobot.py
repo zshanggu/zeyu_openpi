@@ -70,9 +70,14 @@ def _read_task_file(path: Path) -> TaskFile:
 
 
 def _flip(img: np.ndarray) -> np.ndarray:
-    # LIBERO renders camera images with MuJoCo's OpenGL offscreen renderer, whose row
-    # order is bottom-to-top, so frames need a vertical flip to display/train right-side-up.
-    return np.ascontiguousarray(img[:, ::-1])
+    # Raw HDF5 agentview_rgb/eye_in_hand_rgb arrays are the direct, unmodified
+    # obs["agentview_image"]/obs["robot0_eye_in_hand_image"] MuJoCo render buffers --
+    # third_party/libero/scripts/create_dataset.py stores them with no flip of its own
+    # (agentview_images.append(obs["agentview_image"])), so they're in the exact same raw
+    # orientation examples/libero/main.py corrects at inference time via
+    # obs["agentview_image"][::-1, ::-1] (both axes, not just one -- a single-axis flip
+    # left training images mirrored relative to what the model actually sees at eval time).
+    return np.ascontiguousarray(img[::-1, ::-1])
 
 
 def main(

@@ -46,6 +46,13 @@ from openpi_client import websocket_client_policy as _websocket_client_policy
 import sentencepiece
 import tyro
 
+try:
+    # Registers the LiLo-VLA suites (ultra_long, libero_long_plus_plus, ...)
+    # into libero.libero.benchmark's BENCHMARK_MAPPING, if the package is installed.
+    import lilo_vla.benchmark  # noqa: F401
+except ImportError:
+    pass
+
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256
 

@@ -5,6 +5,7 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
+import dataclasses
 import pathlib
 
 import numpy as np
@@ -88,8 +89,20 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(config_name: str, max_frames: int | None = None, local_root: str | None = None):
+    """
+    Args:
+        config_name: Which TrainConfig (see openpi/training/config.py) to compute stats for.
+        max_frames: If set, only use this many frames (subsampled) instead of the whole dataset.
+        local_root: If set, overrides the config's data.local_root -- loads the LeRobot dataset
+            directly from this local directory (instead of resolving repo_id under
+            $HF_LEROBOT_HOME) and writes norm stats directly under `<local_root>/meta/`. Pass the
+            same directory to `scripts/train.py` via `--data.local-root` (or bake it into the
+            config itself) so training reads the exact same stats.
+    """
     config = _config.get_config(config_name)
+    if local_root is not None:
+        config = dataclasses.replace(config, data=dataclasses.replace(config.data, local_root=local_root))
     data_config = config.data.create(config.assets_dirs, config.model)
 
     if data_config.rlds_data_dir is not None:
@@ -110,14 +123,19 @@ def main(config_name: str, max_frames: int | None = None):
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    # Mirrors DataConfigFactory._load_norm_stats's own resolution exactly (see
-    # openpi/training/config.py) so this always writes to wherever training
-    # will actually look for it: AssetsConfig.assets_dir overrides the
-    # default ./assets/<config_name> tree (e.g. to instead write directly
-    # under a LeRobot dataset's own meta/ directory), and asset_id overrides
-    # which subdirectory under that holds this dataset's stats (defaults to
-    # the repo_id if not set).
-    assets_dir = pathlib.Path(config.data.assets.assets_dir) if config.data.assets.assets_dir else config.assets_dirs
+    # Mirrors DataConfigFactory.create_base_config's own resolution exactly (see
+    # openpi/training/config.py) so this always writes to wherever training will actually look
+    # for it: data.local_root (if set) takes priority -- writes directly under
+    # <local_root>/meta/, alongside the LeRobot dataset's own tasks.jsonl/episodes.jsonl/
+    # info.json -- otherwise AssetsConfig.assets_dir overrides the default
+    # ./assets/<config_name> tree, with asset_id choosing the subdirectory under that (defaults
+    # to the repo_id if not set).
+    if config.data.local_root is not None:
+        assets_dir = pathlib.Path(config.data.local_root)
+    elif config.data.assets.assets_dir:
+        assets_dir = pathlib.Path(config.data.assets.assets_dir)
+    else:
+        assets_dir = config.assets_dirs
     output_path = assets_dir / data_config.asset_id
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)

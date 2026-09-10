@@ -137,9 +137,12 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    # local_root, if set, loads directly from that directory instead of resolving repo_id under
+    # $HF_LEROBOT_HOME -- see DataConfig.local_root's docstring.
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.local_root)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        root=data_config.local_root,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },

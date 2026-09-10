@@ -74,9 +74,14 @@ def _read_task_file(path: Path) -> TaskFile:
 
 
 def _flip(img: np.ndarray) -> np.ndarray:
-    # LIBERO renders camera images with MuJoCo's OpenGL offscreen renderer, whose row
-    # order is bottom-to-top, so frames need a vertical flip to display/train right-side-up.
-    return np.ascontiguousarray(img[:, ::-1])
+    # Raw HDF5 agentview_rgb/eye_in_hand_rgb arrays are the direct, unmodified
+    # obs["agentview_image"]/obs["robot0_eye_in_hand_image"] MuJoCo render buffers --
+    # third_party/libero/scripts/create_dataset.py stores them with no flip of its own
+    # (agentview_images.append(obs["agentview_image"])), so they're in the exact same raw
+    # orientation examples/libero/main.py corrects at inference time via
+    # obs["agentview_image"][::-1, ::-1] (both axes, not just one -- a single-axis flip
+    # left training images mirrored relative to what the model actually sees at eval time).
+    return np.ascontiguousarray(img[::-1, ::-1])
 
 
 def _pad_action(last_action: np.ndarray, action_type: str) -> np.ndarray:
@@ -93,6 +98,7 @@ def main(
     data_dir: str,
     *,
     repo_name: str = "your_hf_username/libero_10_subskills",
+    output_dir: str | None = None,
     boundaries_file: str | None = None,
     pad_steps: int = 10,
     action_type: str = "delta",
@@ -106,8 +112,14 @@ def main(
 
     Args:
         data_dir: Directory containing LIBERO *_demo.hdf5 files (e.g. libero_10).
-        repo_name: Output dataset name, also used as the Hugging Face Hub repo id if
-            --push-to-hub is set.
+        repo_name: Dataset identifier, also used as the Hugging Face Hub repo id if
+            --push-to-hub is set. If --output-dir isn't given, this ALSO determines where the
+            dataset is written on disk ($HF_LEROBOT_HOME/<repo_name>).
+        output_dir: If set, writes the dataset directly to this local directory instead of
+            $HF_LEROBOT_HOME/<repo_name> -- pass this SAME directory to
+            `scripts/compute_norm_stats.py --local-root` and `scripts/train.py
+            --data.local-root` so all three steps agree on one single path, without needing to
+            juggle repo_id/$HF_LEROBOT_HOME at all.
         boundaries_file: Path to subskill_boundaries.json. Defaults to
             `<data_dir>/subskill_boundaries.json` (where
             annotate_subskill_boundaries.py writes it by default).
@@ -134,12 +146,13 @@ def main(
         )
     all_boundaries = json.loads(boundaries_path.read_text())
 
-    output_path = HF_LEROBOT_HOME / repo_name
+    output_path = Path(output_dir) if output_dir else HF_LEROBOT_HOME / repo_name
     if output_path.exists():
         shutil.rmtree(output_path)
 
     dataset = LeRobotDataset.create(
         repo_id=repo_name,
+        root=output_dir,
         robot_type="panda",
         fps=20,
         features={

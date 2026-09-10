@@ -47,6 +47,14 @@ class Args:
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
 
+    # If set, overrides every task's own built-in language instruction with this string instead
+    # (e.g. to evaluate a model fine-tuned on short sub-skill prompts, like
+    # pi05_libero_90_lilo22_low_mem_finetune, against a specific instruction rather than
+    # whichever task suite you happen to be pointed at). Spaces must be encoded as underscores
+    # (matching examples/libero/visualize_attention.py's convention) so the value survives being
+    # passed through an unquoted shell variable (e.g. Docker's CLIENT_ARGS) without word-splitting.
+    prompt_override: str | None = None
+
     #################################################################################################################
     # Utils
     #################################################################################################################
@@ -79,6 +87,13 @@ def eval_libero(args: Args) -> None:
         max_steps = 400  # longest training demo has 373 steps
     elif args.task_suite_name.startswith("ultra_long"):
         max_steps = 2400  # LiLo-VLA ultra-long suite: chains up to 16 skills, no reference demos to size against
+    elif args.task_suite_name.startswith("libero_long_plus_plus"):
+        # LiLo-VLA's LIBERO-Long++ suite reuses 6 of LIBERO-10's own tasks (KITCHEN_SCENE3,
+        # LIVING_ROOM_SCENE1/2 (x2)/5/6) verbatim -- see zeyu-LiLo-VLA/lilo_vla/benchmark --
+        # so libero_10's own budget (sized for its longest training demo, 505 steps) applies
+        # directly; the *_variant/*_all suites are the same 6 tasks reordered/duplicated, not
+        # harder ones.
+        max_steps = 520
     else:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
 
@@ -101,6 +116,10 @@ def eval_libero(args: Args) -> None:
         env, task_description = _get_libero_env(
             task, LIBERO_ENV_RESOLUTION, args.seed, horizon=max_steps + args.num_steps_wait
         )
+        if args.prompt_override is not None:
+            override = args.prompt_override.replace("_", " ").strip()
+            logging.info(f"Overriding task instruction {task_description!r} -> {override!r}")
+            task_description = override
 
         # Start episodes
         task_episodes, task_successes = 0, 0
