@@ -215,6 +215,54 @@ class Pi0(_model.BaseModel):
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
+    def _velocity(
+        self,
+        observation: _model.Observation,
+        x_t: at.Float[at.Array, "b ah ad"],
+        time: at.Float[at.Array, ""],
+        *,
+        prefix_tokens: at.Float[at.Array, "b p emb"],
+        prefix_mask: at.Bool[at.Array, "b p"],
+        kv_cache,
+        batch_size: int,
+    ) -> at.Float[at.Array, "b ah ad"]:
+        """Computes v_theta(x_t, t | obs) -- the flow-matching velocity field at one
+        (x_t, t) pair, given a prefix already encoded into `kv_cache`. Factored out
+        of `sample_actions`'s inner loop so both the forward (noise -> action) and
+        reverse (action -> noise, for flow-reversal steering) integration loops can
+        share the exact same computation -- this function's body is unchanged from
+        what used to be inlined in `sample_actions`'s `step` closure.
+        """
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+            observation, x_t, jnp.broadcast_to(time, batch_size)
+        )
+        # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
+        # other
+        suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+        # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
+        # prefix tokens
+        prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+        # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
+        # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
+        full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+        assert full_attn_mask.shape == (
+            batch_size,
+            suffix_tokens.shape[1],
+            prefix_tokens.shape[1] + suffix_tokens.shape[1],
+        )
+        # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
+        positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+
+        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            [None, suffix_tokens],
+            mask=full_attn_mask,
+            positions=positions,
+            kv_cache=kv_cache,
+            adarms_cond=[None, adarms_cond],
+        )
+        assert prefix_out is None
+        return self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
     @override
     def sample_actions(
         self,
@@ -240,36 +288,15 @@ class Pi0(_model.BaseModel):
 
         def step(carry):
             x_t, time = carry
-            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
-            )
-            # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
-            # other
-            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-            # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
-            # prefix tokens
-            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
-            # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
-            # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
-            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
-            assert full_attn_mask.shape == (
-                batch_size,
-                suffix_tokens.shape[1],
-                prefix_tokens.shape[1] + suffix_tokens.shape[1],
-            )
-            # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
-
-            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-                [None, suffix_tokens],
-                mask=full_attn_mask,
-                positions=positions,
+            v_t = self._velocity(
+                observation,
+                x_t,
+                time,
+                prefix_tokens=prefix_tokens,
+                prefix_mask=prefix_mask,
                 kv_cache=kv_cache,
-                adarms_cond=[None, adarms_cond],
+                batch_size=batch_size,
             )
-            assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
-
             return x_t + dt * v_t, time + dt
 
         def cond(carry):
@@ -279,6 +306,88 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    def sample_actions_steered(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        reference_action: at.Float[at.Array, "b rh ad"],
+        pin_steps: int,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+    ) -> _model.Actions:
+        """Flow Reversal Steering (FRS): https://arxiv.org/abs/2606.13675 Sec. 4.1.
+
+        Takes a coarse, "reasonable-but-imprecise" `reference_action` (e.g. a
+        scripted Cartesian nudge, already normalized/padded the same way a real
+        training action would be -- see `Policy.infer`'s handling of an optional
+        `"actions"` observation key) and refines it into an in-distribution action
+        via this same model's own velocity field, biased toward the reference:
+
+          1. Tile `reference_action` (its time axis may be shorter than
+             `self.action_horizon`, e.g. matching a short scripted nudge) out to
+             the full action horizon.
+          2. Integrate the *same* flow ODE `_velocity` computes, but in reverse
+             (t=0, the tiled reference, up to t=1, an estimated noise) -- the
+             literal mirror of `sample_actions`'s forward loop: same `dt`
+             magnitude and step count, opposite sign, opposite start/end.
+          3. "Noise-space in-painting": keep the reverse-estimated noise only for
+             the first `pin_steps` timesteps (the part that actually came from a
+             real reference), and resample everything after that as fresh
+             `N(0,I)` -- so only the near-term nudge is actually pinned to the
+             reference; the rest is left for the policy to fill in based on the
+             observation, exactly like ordinary sampling would.
+          4. Forward-denoise that partially-pinned noise through the *unmodified*
+             `sample_actions` (which already accepts a `noise` override) to get
+             the final steered action.
+
+        Never used by training or the standard eval path -- `sample_actions`
+        itself is completely untouched by this method's existence.
+        """
+        observation = _model.preprocess_observation(None, observation, train=False)
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+
+        ref_len = reference_action.shape[1]
+        if ref_len < self.action_horizon:
+            reps = -(-self.action_horizon // ref_len)  # ceil division
+            reference_action = jnp.tile(reference_action, (1, reps, 1))[:, : self.action_horizon]
+        elif ref_len > self.action_horizon:
+            reference_action = reference_action[:, : self.action_horizon]
+
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+
+        def reverse_step(carry):
+            x_t, time = carry
+            v_t = self._velocity(
+                observation,
+                x_t,
+                time,
+                prefix_tokens=prefix_tokens,
+                prefix_mask=prefix_mask,
+                kv_cache=kv_cache,
+                batch_size=batch_size,
+            )
+            # Mirror image of sample_actions's forward step (x_t + dt * v_t, time + dt):
+            # same magnitude, opposite sign, since we're integrating the same ODE the
+            # other way (t=0, the reference action, up to t=1, noise).
+            return x_t - dt * v_t, time - dt
+
+        def reverse_cond(carry):
+            _x_t, time = carry
+            return time <= 1 + dt / 2
+
+        estimated_noise, _ = jax.lax.while_loop(reverse_cond, reverse_step, (reference_action, 0.0))
+
+        resample_rng, denoise_rng = jax.random.split(rng)
+        fresh_noise = jax.random.normal(resample_rng, estimated_noise.shape)
+        step_idx = jnp.arange(self.action_horizon)[None, :, None]
+        pinned_noise = jnp.where(step_idx < pin_steps, estimated_noise, fresh_noise)
+
+        return self.sample_actions(denoise_rng, observation, num_steps=num_steps, noise=pinned_noise)
 
     def _llm_with_attn(self):
         """Builds a "twin" of self.PaliGemma.llm's underlying Linen module with

@@ -59,15 +59,31 @@ class Policy(BasePolicy):
             self._model = self._model.to(pytorch_device)
             self._model.eval()
             self._sample_actions = model.sample_actions
+            self._sample_actions_steered = None
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            # Flow Reversal Steering (https://arxiv.org/abs/2606.13675): only defined for
+            # JAX flow-matching models (Pi0/Pi0.5) -- guard with getattr since not every
+            # BaseModel subclass implements it (e.g. FAST models use discrete tokenization,
+            # not a flow ODE, so reverse integration doesn't apply).
+            self._sample_actions_steered = (
+                nnx_utils.module_jit(model.sample_actions_steered) if hasattr(model, "sample_actions_steered") else None
+            )
             self._rng = rng or jax.random.key(0)
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
+        # Steering (see sample_actions_steered): a caller can supply a coarse reference
+        # action via obs["actions"] -- this is deliberately the SAME key a training batch
+        # would use, so it flows through the exact same Normalize/PadStatesAndActions
+        # pipeline a real action would (see e.g. LiberoInputs' documented "actions" passthrough,
+        # "Actions are only available during training" -- this is the inference-time use of
+        # that same path). `steering_pin_steps` is metadata, not observation data, so it's
+        # popped before the transform pipeline runs rather than routed through it.
+        steering_pin_steps = inputs.pop("steering_pin_steps", None)
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
@@ -89,9 +105,21 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
+        if "actions" in inputs and self._sample_actions_steered is not None:
+            reference_action = inputs["actions"]
+            pin_steps = int(steering_pin_steps) if steering_pin_steps is not None else reference_action.shape[1]
+            actions = self._sample_actions_steered(
+                sample_rng_or_pytorch_device,
+                observation,
+                reference_action=reference_action,
+                pin_steps=pin_steps,
+                **{k: v for k, v in sample_kwargs.items() if k != "noise"},
+            )
+        else:
+            actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
         outputs = {
             "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+            "actions": actions,
         }
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
