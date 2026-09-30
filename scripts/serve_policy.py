@@ -1,9 +1,11 @@
 import dataclasses
 import enum
+import gc
 import logging
 import socket
 
 import tyro
+from openpi_client import base_policy as _base_policy
 
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
@@ -54,6 +56,66 @@ class Args:
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
+    # If true, an already-connected client can swap the served checkpoint at
+    # runtime (see ReloadablePolicy below) instead of this process only ever
+    # serving the one checkpoint it started with. Opt-in: this is a real
+    # capability escalation (any client that can reach this port can replace
+    # the running model), so it's off unless explicitly requested. Built for
+    # zeyu-Pi0.5Viewer's "Select Model" button (see its backend/sim_worker.py
+    # and backend/app.py for the client side).
+    enable_checkpoint_reload: bool = False
+
+
+class ReloadablePolicy(_base_policy.BasePolicy):
+    """Wraps a Policy so its checkpoint can be swapped in-process at runtime.
+
+    A reserved `_reload_checkpoint` key in the observation dict (instead of
+    the usual real observation) triggers a reload rather than an inference
+    call: `{"_reload_checkpoint": {"config": "<train config name>", "dir":
+    "<checkpoint dir>"}}`, returning `{"reloaded": True, ...}` on success or
+    `{"reload_error": "<message>"}` on failure -- never raises, so a bad
+    request just gets reported back to the client instead of tearing down the
+    whole server/connection.
+    """
+
+    def __init__(self, policy: _policy.Policy, *, default_prompt: str | None) -> None:
+        self._policy = policy
+        self._default_prompt = default_prompt
+
+    @property
+    def metadata(self) -> dict:
+        return self._policy.metadata
+
+    def infer(self, obs: dict) -> dict:
+        reload_request = obs.get("_reload_checkpoint")
+        if reload_request is not None:
+            return self._reload(reload_request)
+        return self._policy.infer(obs)
+
+    def reset(self) -> None:
+        self._policy.reset()
+
+    def _reload(self, request: dict) -> dict:
+        config_name, checkpoint_dir = request["config"], request["dir"]
+        logging.info("Reloading checkpoint: config=%s dir=%s", config_name, checkpoint_dir)
+        try:
+            new_policy = _policy_config.create_trained_policy(
+                _config.get_config(config_name), checkpoint_dir, default_prompt=self._default_prompt
+            )
+        except Exception as exc:  # noqa: BLE001 -- reported to the client, not raised
+            logging.exception("Checkpoint reload failed")
+            return {"reload_error": str(exc)}
+        old_policy = self._policy
+        self._policy = new_policy
+        # Old params are JAX device arrays; drop the last reference and force
+        # collection so the old checkpoint's GPU memory is actually freed
+        # before/while the new one is loaded (these GPUs have no room to hold
+        # two checkpoints' params + optimizer-adjacent buffers at once).
+        del old_policy
+        gc.collect()
+        logging.info("Checkpoint reload complete: config=%s dir=%s", config_name, checkpoint_dir)
+        return {"reloaded": True, "config": config_name, "dir": checkpoint_dir}
+
 
 # Default checkpoints that should be used for each environment.
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
@@ -99,6 +161,9 @@ def create_policy(args: Args) -> _policy.Policy:
 def main(args: Args) -> None:
     policy = create_policy(args)
     policy_metadata = policy.metadata
+
+    if args.enable_checkpoint_reload:
+        policy = ReloadablePolicy(policy, default_prompt=args.default_prompt)
 
     # Record the policy's behavior.
     if args.record:

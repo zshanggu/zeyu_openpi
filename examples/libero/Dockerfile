@@ -44,7 +44,16 @@ COPY ./packages/openpi-client/pyproject.toml /tmp/openpi-client/pyproject.toml
 # Install python dependencies.
 RUN uv venv --python 3.8 $UV_PROJECT_ENVIRONMENT
 RUN uv pip sync /tmp/requirements.txt /tmp/requirements-libero.txt /tmp/openpi-client/pyproject.toml --extra-index-url https://download.pytorch.org/whl/cu113 --index-strategy=unsafe-best-match --build-constraint /tmp/requirements.txt
-ENV PYTHONPATH=/app:/app/packages/openpi-client/src:/app/third_party/libero
+# /lilo-vla (see compose.yml, LILO_VLA_HOME) is on PYTHONPATH rather than
+# pip-installed by CMD below: its pyproject.toml now declares
+# requires-python>=3.10, which this venv (pinned to 3.8 for LIBERO/robosuite
+# compatibility) can never satisfy -- uv checks requires-python before even
+# looking at dependencies, so `uv pip install -e` (with or without --no-deps)
+# always fails outright. A plain import doesn't consult that metadata at all,
+# and lilo_vla.benchmark has no 3.10-only syntax, so this is sufficient
+# (confirmed in zeyu-Pi0.5Viewer, which hit the same failure: `import
+# lilo_vla.benchmark` succeeds with just this on the path).
+ENV PYTHONPATH=/app:/app/packages/openpi-client/src:/app/third_party/libero:/lilo-vla
 
 # Create a default config file to avoid an input prompt from LIBERO's init script.
 # https://github.com/Lifelong-Robot-Learning/LIBERO/blob/master/libero/libero/__init__.py
@@ -61,5 +70,7 @@ RUN mkdir -p /usr/share/glvnd/egl_vendor.d && echo '{"file_format_version" : "1.
 
 # CLIENT_SCRIPT lets you swap in a different client script (e.g.
 # examples/libero/visualize_attention.py) without rebuilding; defaults to the
-# standard main.py.
-CMD ["/bin/bash", "-c", "source /.venv/bin/activate && if [ -f /lilo-vla/pyproject.toml ]; then uv pip install -e /lilo-vla; fi && python ${CLIENT_SCRIPT:-examples/libero/main.py} $CLIENT_ARGS"]
+# standard main.py. /lilo-vla's presence on PYTHONPATH (see ENV above) is what
+# makes the LiLo-VLA suites available if that sibling repo is mounted in --
+# no install step needed here.
+CMD ["/bin/bash", "-c", "source /.venv/bin/activate && python ${CLIENT_SCRIPT:-examples/libero/main.py} $CLIENT_ARGS"]

@@ -844,6 +844,34 @@ _CONFIGS = [
         batch_size=32,
         num_train_steps=30_000,
     ),
+    TrainConfig(
+        # Full (non-LoRA) fine-tune of the same lilo22 sub-skill dataset as
+        # pi05_libero_90_lilo22_low_mem_finetune above. Per the top-level README's Requirements
+        # table, full fine-tuning needs >70GB on a single GPU -- this hardware only has 2x RTX
+        # 4090 (24GB each, 48GB total), so fsdp_devices=2 shards params/optimizer state across
+        # both GPUs (mesh_shape becomes (1, 2): no data-parallel replication, the whole global
+        # batch is processed by the one FSDP-sharded group) to fit at all. Even so this is tight,
+        # so batch_size is kept small; raise it if you have headroom, lower it (or add
+        # bf16-optimizer-state settings) if you hit an OOM.
+        name="pi05_libero_90_lilo22_full_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="libero_90_lilo22_subskills",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            # The actual dataset location (not the "your_hf_username" placeholder above) --
+            # this is also where compute_norm_stats.py already wrote meta/norm_stats.json.
+            local_root="/data/zeyu/PHD_LAB/Amazon_Project/lerobot_datasets/libero90_lilo22_256",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        fsdp_devices=2,
+        batch_size=16,
+        num_train_steps=30_000,
+    ),
     #
     # Fine-tuning Aloha configs.
     #

@@ -44,6 +44,20 @@ Usage:
     uv run examples/libero/convert_libero_subskills_to_lerobot.py \
         --data-dir /path/to/libero_10 \
         --repo-name your_hf_username/libero_10_subskills
+
+    # OpenVLA-regenerated 256px data with randomized-distractor episodes (libero_modified_hdf5/...):
+    # standard demos and randomized ones into two separate datasets
+    uv run examples/libero/convert_libero_subskills_to_lerobot.py \
+        --data-dir /path/to/libero90_openvla_256 --image-size 256 --skip-detection-failed \
+        --repo-name libero90_lilo22_256 --output-dir /path/out/libero90_openvla_256_lilo22
+    ... --groups distractor --output-dir /path/out/libero90_openvla_256_lilo22_distractor
+
+    # Several source folders merged into ONE dataset (standard episodes first, then the randomized ones):
+    uv run examples/libero/convert_libero_subskills_to_lerobot.py \
+        --data-dir /path/to/libero90_openvla_256 \
+        --extra-data-dirs /path/to/libero90_openvla_256_wooden_cabinet \
+        --groups both --image-size 256 --skip-detection-failed \
+        --repo-name libero90_lilo22_256 --output-dir /path/out/libero90_lilo22_256
 """
 
 from __future__ import annotations
@@ -69,8 +83,18 @@ class TaskFile:
 
 def _read_task_file(path: Path) -> TaskFile:
     with h5py.File(path, "r") as f:
-        env_args = json.loads(f["data"].attrs["env_args"])
-        return TaskFile(path=path, control_freq=float(env_args["env_kwargs"].get("control_freq", 20)))
+        # Raw LIBERO files carry env_args; OpenVLA-regenerated ones (libero_modified_hdf5/*) carry no
+        # attributes beyond problem_info. Nothing downstream needs the frequency (fps is fixed at 20).
+        attrs = f["data"].attrs
+        control_freq = 20.0
+        if "env_args" in attrs:
+            control_freq = float(json.loads(attrs["env_args"])["env_kwargs"].get("control_freq", 20))
+        return TaskFile(path=path, control_freq=control_freq)
+
+
+def _demo_sort_key(name: str) -> tuple:
+    """demo_<N> -> (N,); distractor_<N>_<K> -> (N, K)."""
+    return tuple(int(x) for x in name.split("_")[1:] if x.isdigit())
 
 
 def _flip(img: np.ndarray) -> np.ndarray:
@@ -105,6 +129,11 @@ def main(
     image_size: int = 128,
     max_episodes_per_task: int | None = None,
     task_glob: str = "*.hdf5",
+    groups: str = "standard",
+    skip_detection_failed: bool = False,
+    extra_data_dirs: tuple[str, ...] = (),
+    image_writer_processes: int = 5,
+    image_writer_threads: int = 10,
     push_to_hub: bool = False,
 ):
     """Convert a directory of raw LIBERO *_demo.hdf5 files into a LeRobot
@@ -132,19 +161,44 @@ def main(
             size at train/inference time regardless, so this normally doesn't need changing.
         max_episodes_per_task: If set, only convert the first N demos of each task file.
         task_glob: Glob pattern (relative to data_dir) selecting which *.hdf5 files to convert.
+        groups: Which episodes to convert. "standard" (default, the original behaviour): the `data` group.
+            "distractor": the `data_distractor` group written by libero_rerender_script/rerender_libero90.py
+            (the same demos replayed with the non-task objects randomized). "both": the two together.
+            Convert them into SEPARATE datasets (run twice) if the randomized episodes must not be mixed
+            with the standard ones -- LeRobot episodes carry no group label; every episode's origin is
+            recorded in `meta/episode_source.jsonl` regardless.
+        extra_data_dirs: More HDF5 directories to merge into the SAME output dataset (each with its own
+            subskill_boundaries.json). Episodes are written group by group, then source by source
+            (data_dir first, then these in order): with --groups both, every standard episode of every
+            source comes first, then every randomized one, so each group is one contiguous episode range;
+            `meta/merge_info.json` records the ranges and `meta/episode_source.jsonl` every episode's origin.
+        image_writer_processes / image_writer_threads: LeRobot's PNG-encoding workers (encoding is the
+            bottleneck; raise the process count on a many-core machine).
+        skip_detection_failed: Drop a segment whose boundary was a fallback guess
+            (`detection_failed` in subskill_boundaries.json) instead of converting it with a warning.
         push_to_hub: Whether to push the resulting dataset to the Hugging Face Hub.
     """
-    data_dir_path = Path(data_dir)
-    task_paths = sorted(data_dir_path.glob(task_glob))
-    if not task_paths:
-        raise FileNotFoundError(f"No files matching {task_glob!r} found in {data_dir_path}")
+    if extra_data_dirs and boundaries_file:
+        raise ValueError("--boundaries-file can only be used with a single data directory")
 
-    boundaries_path = Path(boundaries_file) if boundaries_file else data_dir_path / "subskill_boundaries.json"
-    if not boundaries_path.is_file():
-        raise FileNotFoundError(
-            f"{boundaries_path} not found -- run annotate_subskill_boundaries.py on {data_dir_path} first."
-        )
-    all_boundaries = json.loads(boundaries_path.read_text())
+    @dataclasses.dataclass
+    class Source:
+        dir: Path
+        task_paths: list
+        boundaries: dict
+        boundaries_path: Path
+
+    sources: list[Source] = []
+    for d in (data_dir, *extra_data_dirs):
+        dir_path = Path(d)
+        paths = sorted(dir_path.glob(task_glob))
+        if not paths:
+            raise FileNotFoundError(f"No files matching {task_glob!r} found in {dir_path}")
+        b_path = Path(boundaries_file) if boundaries_file else dir_path / "subskill_boundaries.json"
+        if not b_path.is_file():
+            raise FileNotFoundError(f"{b_path} not found -- run annotate_subskill_boundaries.py on {dir_path} first.")
+        sources.append(Source(dir_path, paths, json.loads(b_path.read_text()), b_path))
+    boundaries_path = sources[0].boundaries_path  # only used in the summary message below
 
     output_path = Path(output_dir) if output_dir else HF_LEROBOT_HOME / repo_name
     if output_path.exists():
@@ -169,30 +223,36 @@ def main(
             "state": {"dtype": "float32", "shape": (8,), "names": ["state"]},
             "actions": {"dtype": "float32", "shape": (7,), "names": ["actions"]},
         },
-        image_writer_threads=10,
-        image_writer_processes=5,
+        image_writer_threads=image_writer_threads,
+        image_writer_processes=image_writer_processes,
     )
 
     num_episodes_written = 0
     num_demos_skipped = 0
-    for task_path in tqdm.tqdm(task_paths, desc="tasks"):
+    num_segments_skipped_failed = 0
+    episode_source: list[dict] = []  # provenance of every written episode -> meta/episode_source.jsonl
+    wanted_groups = {"standard": ["data"], "distractor": ["data_distractor"], "both": ["data", "data_distractor"]}[groups]
+    work = [(g, src, tp) for g in wanted_groups for src in sources for tp in src.task_paths]  # group-major order
+    for group_name, source, task_path in tqdm.tqdm(work, desc="task files"):
         task = _read_task_file(task_path)
-        task_boundaries = all_boundaries.get(task_path.name)
+        task_boundaries = source.boundaries.get(task_path.name)
         if task_boundaries is None:
-            print(f"warning: no boundaries for {task_path.name} in {boundaries_path}, skipping this task file")
+            print(f"warning: no boundaries for {task_path.name} in {source.boundaries_path}, skipping this task file")
             continue
 
         with h5py.File(task.path, "r") as f:
-            data = f["data"]
-            demo_keys = sorted(data.keys(), key=lambda k: int(k.split("_")[1]))[:max_episodes_per_task]
+            demo_refs = []  # (group name, demo key)
+            if group_name in f:
+                keys = sorted(f[group_name].keys(), key=_demo_sort_key)[:max_episodes_per_task]
+                demo_refs += [(group_name, k) for k in keys]
 
-            for demo_key in tqdm.tqdm(demo_keys, desc=task_path.stem, leave=False):
+            for group_name, demo_key in tqdm.tqdm(demo_refs, desc=task_path.stem, leave=False):
                 demo_entry = task_boundaries["demos"].get(demo_key)
                 if demo_entry is None:
                     num_demos_skipped += 1
                     continue
 
-                demo = data[demo_key]
+                demo = f[group_name][demo_key]
                 obs = demo["obs"]
                 actions = demo["actions"][()].astype(np.float32)
                 states = np.concatenate([obs["ee_states"][()], obs["gripper_states"][()]], axis=-1).astype(np.float32)
@@ -201,6 +261,9 @@ def main(
 
                 for boundary in demo_entry["boundaries"]:
                     start, end = boundary["start_frame"], boundary["end_frame"]
+                    if boundary.get("detection_failed") and skip_detection_failed:
+                        num_segments_skipped_failed += 1
+                        continue
                     if boundary.get("detection_failed"):
                         print(
                             f"warning: {task_path.name}/{demo_key} skill {boundary['skill_idx']} "
@@ -231,9 +294,36 @@ def main(
                                 }
                             )
                     dataset.save_episode()
+                    episode_source.append(
+                        {
+                            "episode_index": num_episodes_written,
+                            "source_dir": str(source.dir),
+                            "hdf5": task_path.name,
+                            "group": group_name,
+                            "demo": demo_key,
+                            "skill_idx": boundary["skill_idx"],
+                            "prompt": boundary["prompt"],
+                            "start_frame": start,
+                            "end_frame": end,
+                            "padded_frames": pad_steps,
+                        }
+                    )
                     num_episodes_written += 1
 
-    print(f"Wrote {num_episodes_written} sub-skill episodes ({num_demos_skipped} demos skipped, not in {boundaries_path.name})")
+    (output_path / "meta").mkdir(parents=True, exist_ok=True)
+    merge_info: dict = {"sources": [str(src.dir) for src in sources], "groups": {}, "by_source_and_group": {}}
+    for r in episode_source:
+        g = merge_info["groups"].setdefault(r["group"], {"episodes": 0, "first_episode_index": r["episode_index"], "last_episode_index": r["episode_index"]})
+        g["episodes"] += 1
+        g["last_episode_index"] = r["episode_index"]
+        key = f"{r['source_dir']}::{r['group']}"
+        merge_info["by_source_and_group"][key] = merge_info["by_source_and_group"].get(key, 0) + 1
+    (output_path / "meta" / "merge_info.json").write_text(json.dumps(merge_info, indent=2))
+    (output_path / "meta" / "episode_source.jsonl").write_text("".join(json.dumps(r) + "\n" for r in episode_source))
+    print(
+        f"Wrote {num_episodes_written} sub-skill episodes ({num_demos_skipped} demos skipped, not in {boundaries_path.name}"
+        f"; {num_segments_skipped_failed} segments skipped for failed detection; {len(sources)} source dir(s))"
+    )
 
     if push_to_hub:
         dataset.push_to_hub(
