@@ -78,9 +78,13 @@ class ReloadablePolicy(_base_policy.BasePolicy):
     whole server/connection.
     """
 
-    def __init__(self, policy: _policy.Policy, *, default_prompt: str | None) -> None:
+    def __init__(
+        self, policy: _policy.Policy, *, default_prompt: str | None, checkpoint: "Checkpoint | None" = None
+    ) -> None:
         self._policy = policy
         self._default_prompt = default_prompt
+        # The checkpoint being served, so a failed reload can restore it (None: started from a Default policy).
+        self._current = (checkpoint.config, checkpoint.dir) if checkpoint is not None else None
 
     @property
     def metadata(self) -> dict:
@@ -90,29 +94,41 @@ class ReloadablePolicy(_base_policy.BasePolicy):
         reload_request = obs.get("_reload_checkpoint")
         if reload_request is not None:
             return self._reload(reload_request)
+        if self._policy is None:
+            raise RuntimeError("No checkpoint loaded (the last reload failed); load one with Select Model")
         return self._policy.infer(obs)
 
     def reset(self) -> None:
         self._policy.reset()
 
+    def _load(self, config_name: str, checkpoint_dir: str) -> _policy.Policy:
+        return _policy_config.create_trained_policy(
+            _config.get_config(config_name), checkpoint_dir, default_prompt=self._default_prompt
+        )
+
     def _reload(self, request: dict) -> dict:
         config_name, checkpoint_dir = request["config"], request["dir"]
         logging.info("Reloading checkpoint: config=%s dir=%s", config_name, checkpoint_dir)
+        # Free the old checkpoint BEFORE loading the new one: its params are JAX device arrays, and the policy
+        # GPU usually has room for only one checkpoint (e.g. a 24 GB card shared with Isaac Sim at
+        # XLA_PYTHON_CLIENT_MEM_FRACTION=0.30). Loading first and freeing after needs two at once -> OOM.
+        self._policy = None
+        gc.collect()
         try:
-            new_policy = _policy_config.create_trained_policy(
-                _config.get_config(config_name), checkpoint_dir, default_prompt=self._default_prompt
-            )
+            self._policy = self._load(config_name, checkpoint_dir)
         except Exception as exc:  # noqa: BLE001 -- reported to the client, not raised
             logging.exception("Checkpoint reload failed")
+            self._policy = None
+            gc.collect()
+            if self._current is not None:
+                # Put the previous checkpoint back so the server keeps serving something.
+                try:
+                    self._policy = self._load(*self._current)
+                    logging.info("Restored previous checkpoint: config=%s dir=%s", *self._current)
+                except Exception:  # noqa: BLE001
+                    logging.exception("Restoring the previous checkpoint failed too; no policy loaded")
             return {"reload_error": str(exc)}
-        old_policy = self._policy
-        self._policy = new_policy
-        # Old params are JAX device arrays; drop the last reference and force
-        # collection so the old checkpoint's GPU memory is actually freed
-        # before/while the new one is loaded (these GPUs have no room to hold
-        # two checkpoints' params + optimizer-adjacent buffers at once).
-        del old_policy
-        gc.collect()
+        self._current = (config_name, checkpoint_dir)
         logging.info("Checkpoint reload complete: config=%s dir=%s", config_name, checkpoint_dir)
         return {"reloaded": True, "config": config_name, "dir": checkpoint_dir}
 
@@ -163,7 +179,11 @@ def main(args: Args) -> None:
     policy_metadata = policy.metadata
 
     if args.enable_checkpoint_reload:
-        policy = ReloadablePolicy(policy, default_prompt=args.default_prompt)
+        policy = ReloadablePolicy(
+            policy,
+            default_prompt=args.default_prompt,
+            checkpoint=args.policy if isinstance(args.policy, Checkpoint) else None,
+        )
 
     # Record the policy's behavior.
     if args.record:

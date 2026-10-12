@@ -872,6 +872,65 @@ _CONFIGS = [
         batch_size=16,
         num_train_steps=30_000,
     ),
+    TrainConfig(
+        # LoRA fine-tune on the SoftMimicGen Franka towel demos (50 demos, ~6.6k frames, 20 Hz), converted
+        # with examples/franka_towel/convert_towel_hdf5_to_lerobot.py. The converted keys (image,
+        # wrist_image, state, actions, task) match the LIBERO ones, so LeRobotLiberoDataConfig/LiberoInputs
+        # are reused as-is. Actions are already delta EEF pose + absolute gripper, hence no extra delta
+        # transform. local_root is set (not None) so norm stats live in <local_root>/meta/ and checkpoints
+        # bundle them as assets/meta/ -- see pi05_libero_90_lilo22_low_mem_finetune for why that matters
+        # for serve_policy.py.
+        #
+        # Steps: 50 demos is small -- 10k steps at batch 32 is already ~50 epochs; keep the intermediate
+        # checkpoints (save_interval/keep_period) and pick one by sim success rate rather than the last.
+        name="pi05_franka_towel_low_mem_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="franka_towel",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            local_root="/data/zeyu/PHD_LAB/Deformable/lerobot_datasets/franka_towel_n50_seed1_256",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=32,
+        num_train_steps=10_000,
+        save_interval=1000,
+        keep_period=2000,
+    ),
+    TrainConfig(
+        # Full fine-tune of the same towel dataset. Needs FSDP across big cards (e.g. barista, 4x RTX 6000
+        # Ada 48 GB): set fsdp_devices to the number of GPUs you train on.
+        name="pi05_franka_towel_full_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="franka_towel",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            local_root="/data/zeyu/PHD_LAB/Deformable/lerobot_datasets/franka_towel_n50_seed1_256",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        fsdp_devices=4,
+        batch_size=32,
+        num_train_steps=10_000,
+        save_interval=1000,
+        keep_period=2000,
+    ),
     #
     # Fine-tuning Aloha configs.
     #
