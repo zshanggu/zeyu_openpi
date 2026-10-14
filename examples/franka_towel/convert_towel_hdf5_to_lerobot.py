@@ -35,6 +35,9 @@ Usage:
         --hdf5 /data/hyeon/share/franka_towel_n50_seed1_20260926_1813/hdf5/franka_towel_n50_seed1.hdf5 \
         --output-dir /data/zeyu/PHD_LAB/Deformable/lerobot_datasets/franka_towel_n50_seed1_256
 
+Several HDF5 files (same env and camera layout) can be merged into one dataset: pass them all to
+--hdf5, e.g. `--hdf5 a.hdf5 b.hdf5`. Their episodes are written file by file, in the given order.
+
 Then pass the same directory to `scripts/compute_norm_stats.py --local-root` (or rely on the
 `pi05_franka_towel_*` configs' local_root) and train.
 
@@ -78,7 +81,7 @@ def _state(demo: h5py.Group, layout: str) -> np.ndarray:
 
 
 def main(
-    hdf5: str,
+    hdf5: list[str],
     *,
     repo_name: str = "franka_towel",
     output_dir: str | None = None,
@@ -90,10 +93,10 @@ def main(
     image_writer_processes: int = 5,
     image_writer_threads: int = 10,
 ):
-    """Convert one SoftMimicGen Franka towel HDF5 file to a LeRobot dataset.
+    """Convert one or more SoftMimicGen Franka towel HDF5 files to one LeRobot dataset.
 
     Args:
-        hdf5: Path to the SoftMimicGen HDF5 file.
+        hdf5: Path(s) to the SoftMimicGen HDF5 file(s).
         repo_name: Dataset identifier. If --output-dir isn't given, the dataset is written to
             $HF_LEROBOT_HOME/<repo_name>.
         output_dir: Write the dataset directly to this directory (recommended) -- pass the SAME directory
@@ -102,74 +105,88 @@ def main(
         state: State layout, "eef" or "joint" (see module docstring).
         image_size: Images are resized (with padding) to image_size x image_size. The model resizes to
             224 anyway; storing the native 512x512 only makes the dataset larger.
-        max_episodes: If set, only convert the first N demos (quick smoke test).
+        max_episodes: If set, only convert the first N demos of each file (quick smoke test).
         only_success: Skip demos whose `success` attr is false.
         image_writer_processes / image_writer_threads: LeRobot's PNG-encoding workers.
     """
-    hdf5_path = Path(hdf5)
+    hdf5_paths = [Path(p) for p in hdf5]
     output_path = Path(output_dir) if output_dir else HF_LEROBOT_HOME / repo_name
     if output_path.exists():
         shutil.rmtree(output_path)
 
-    with h5py.File(hdf5_path, "r") as f:
-        data = f["data"]
-        env_args = json.loads(data.attrs["env_args"])
-        sim = env_args.get("sim_args", {})
-        fps = round(1.0 / (sim.get("dt", 0.01) * sim.get("decimation", 5)))
-        demo_keys = sorted(data.keys(), key=lambda k: int(k.split("_")[1]))
-        if only_success:
-            demo_keys = [k for k in demo_keys if bool(data[k].attrs.get("success", True))]
-        demo_keys = demo_keys[:max_episodes]
+    # Every file must run at the same control rate (and come from the same env).
+    env_args = None
+    for hdf5_path in hdf5_paths:
+        with h5py.File(hdf5_path, "r") as f:
+            args = json.loads(f["data"].attrs["env_args"])
+        if env_args is not None and (args.get("env_name"), args.get("sim_args")) != (
+            env_args.get("env_name"),
+            env_args.get("sim_args"),
+        ):
+            raise ValueError(f"{hdf5_path}: env_args differ from {hdf5_paths[0]}")
+        env_args = args
+    sim = env_args.get("sim_args", {})
+    fps = round(1.0 / (sim.get("dt", 0.01) * sim.get("decimation", 5)))
 
-        dataset = LeRobotDataset.create(
-            repo_id=repo_name,
-            root=output_path,
-            robot_type="panda",
-            fps=fps,
-            features={
-                "image": {
-                    "dtype": "image",
-                    "shape": (image_size, image_size, 3),
-                    "names": ["height", "width", "channel"],
-                },
-                "wrist_image": {
-                    "dtype": "image",
-                    "shape": (image_size, image_size, 3),
-                    "names": ["height", "width", "channel"],
-                },
-                "state": {"dtype": "float32", "shape": (9,), "names": ["state"]},
-                "actions": {"dtype": "float32", "shape": (7,), "names": ["actions"]},
+    dataset = LeRobotDataset.create(
+        repo_id=repo_name,
+        root=output_path,
+        robot_type="panda",
+        fps=fps,
+        features={
+            "image": {
+                "dtype": "image",
+                "shape": (image_size, image_size, 3),
+                "names": ["height", "width", "channel"],
             },
-            image_writer_threads=image_writer_threads,
-            image_writer_processes=image_writer_processes,
-        )
+            "wrist_image": {
+                "dtype": "image",
+                "shape": (image_size, image_size, 3),
+                "names": ["height", "width", "channel"],
+            },
+            "state": {"dtype": "float32", "shape": (9,), "names": ["state"]},
+            "actions": {"dtype": "float32", "shape": (7,), "names": ["actions"]},
+        },
+        image_writer_threads=image_writer_threads,
+        image_writer_processes=image_writer_processes,
+    )
 
-        num_frames = 0
-        for demo_key in tqdm.tqdm(demo_keys, desc=hdf5_path.stem):
-            demo = data[demo_key]
-            actions = demo["actions"][()].astype(np.float32)
-            states = _state(demo, state)
-            room = image_tools.resize_with_pad(demo["obs"][ROOM_CAMERA][()], image_size, image_size)
-            wrist = image_tools.resize_with_pad(demo["obs"][WRIST_CAMERA][()], image_size, image_size)
+    episodes: list[str] = []  # "<file>:<demo>" in dataset episode order
+    num_frames = 0
+    for hdf5_path in hdf5_paths:
+        with h5py.File(hdf5_path, "r") as f:
+            data = f["data"]
+            demo_keys = sorted(data.keys(), key=lambda k: int(k.split("_")[1]))
+            if only_success:
+                demo_keys = [k for k in demo_keys if bool(data[k].attrs.get("success", True))]
+            demo_keys = demo_keys[:max_episodes]
 
-            for i in range(actions.shape[0]):
-                dataset.add_frame(
-                    {
-                        "image": room[i],
-                        "wrist_image": wrist[i],
-                        "state": states[i],
-                        "actions": actions[i],
-                        "task": prompt,
-                    }
-                )
-            dataset.save_episode()
-            num_frames += actions.shape[0]
+            for demo_key in tqdm.tqdm(demo_keys, desc=hdf5_path.stem):
+                demo = data[demo_key]
+                actions = demo["actions"][()].astype(np.float32)
+                states = _state(demo, state)
+                room = image_tools.resize_with_pad(demo["obs"][ROOM_CAMERA][()], image_size, image_size)
+                wrist = image_tools.resize_with_pad(demo["obs"][WRIST_CAMERA][()], image_size, image_size)
+
+                for i in range(actions.shape[0]):
+                    dataset.add_frame(
+                        {
+                            "image": room[i],
+                            "wrist_image": wrist[i],
+                            "state": states[i],
+                            "actions": actions[i],
+                            "task": prompt,
+                        }
+                    )
+                dataset.save_episode()
+                num_frames += actions.shape[0]
+                episodes.append(f"{hdf5_path.name}:{demo_key}")
 
     info = {
-        "source_hdf5": str(hdf5_path.resolve()),
+        "source_hdf5": [str(p.resolve()) for p in hdf5_paths],
         "env_name": env_args.get("env_name"),
         "fps": fps,
-        "episodes": demo_keys,
+        "episodes": episodes,
         "frames": num_frames,
         "prompt": prompt,
         "state_layout": state,
@@ -184,7 +201,7 @@ def main(
         "images_flipped": False,
     }
     (output_path / "meta" / "conversion_info.json").write_text(json.dumps(info, indent=1))
-    print(f"Wrote {len(demo_keys)} episodes, {num_frames} frames to {output_path}")
+    print(f"Wrote {len(episodes)} episodes, {num_frames} frames to {output_path}")
 
 
 if __name__ == "__main__":
