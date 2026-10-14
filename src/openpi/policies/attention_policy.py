@@ -81,7 +81,18 @@ class AttentionCapturingPolicy(_policy.Policy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
-        inputs = jax.tree.map(lambda x: x, obs)
+        inputs = dict(obs)
+        # Reserved client-side control key, popped before anything else touches it: lets a
+        # caller skip this class's attention-capturing path (a separate, more expensive
+        # JIT-compiled graph -- sample_actions_with_attention, not sample_actions) and fall
+        # back to the base Policy's ordinary, no-attention infer() for this call. Defaults to
+        # True so an unmodified caller (e.g. examples/libero/visualize_attention.py) keeps
+        # getting attention exactly as before; see zeyu-Pi0.5Viewer's "Mode" menu's "Calculate
+        # attention" toggle, the only current caller that ever sets this to False.
+        if not inputs.pop("_compute_attention", True):
+            return super().infer(inputs, noise=noise)
+
+        inputs = jax.tree.map(lambda x: x, inputs)
         inputs = self._input_transform(inputs)
         inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
         self._rng, sample_rng = jax.random.split(self._rng)

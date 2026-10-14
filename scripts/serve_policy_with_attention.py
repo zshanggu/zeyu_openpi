@@ -23,6 +23,7 @@ that subcommand's own fields (Checkpoint's `config`/`dir`), not Args':
 import dataclasses
 import logging
 import socket
+from typing import Callable
 
 import tyro
 
@@ -35,6 +36,8 @@ from openpi.serving import websocket_policy_server
 # not the repo root, so `scripts` isn't importable as a package here -- only
 # `serve_policy` (its sibling file) is.
 from serve_policy import Args as _ServePolicyArgs
+from serve_policy import Checkpoint as _Checkpoint
+from serve_policy import ReloadablePolicy as _ReloadablePolicy
 from serve_policy import create_policy as _create_base_policy
 
 
@@ -58,9 +61,28 @@ def create_policy(args: Args) -> _policy.Policy:
     )
 
 
+def _attention_policy_factory(args: Args) -> Callable[[str, str], _policy.Policy]:
+    # Rebuilds an AttentionCapturingPolicy (not a plain Policy) on reload, so a
+    # checkpoint swap via zeyu-Pi0.5Viewer's "Select Model" keeps serving attention
+    # alongside actions instead of silently falling back to the base Policy.
+    def factory(config_name: str, checkpoint_dir: str) -> _policy.Policy:
+        reload_args = dataclasses.replace(args, policy=_Checkpoint(config=config_name, dir=checkpoint_dir))
+        return create_policy(reload_args)
+
+    return factory
+
+
 def main(args: Args) -> None:
     policy = create_policy(args)
     policy_metadata = policy.metadata
+
+    if args.enable_checkpoint_reload:
+        policy = _ReloadablePolicy(
+            policy,
+            default_prompt=args.default_prompt,
+            checkpoint=args.policy if isinstance(args.policy, _Checkpoint) else None,
+            policy_factory=_attention_policy_factory(args),
+        )
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)

@@ -3,6 +3,7 @@ import enum
 import gc
 import logging
 import socket
+from typing import Callable
 
 import tyro
 from openpi_client import base_policy as _base_policy
@@ -79,12 +80,22 @@ class ReloadablePolicy(_base_policy.BasePolicy):
     """
 
     def __init__(
-        self, policy: _policy.Policy, *, default_prompt: str | None, checkpoint: "Checkpoint | None" = None
+        self,
+        policy: _policy.Policy,
+        *,
+        default_prompt: str | None,
+        checkpoint: "Checkpoint | None" = None,
+        policy_factory: Callable[[str, str], _policy.Policy] | None = None,
     ) -> None:
         self._policy = policy
         self._default_prompt = default_prompt
         # The checkpoint being served, so a failed reload can restore it (None: started from a Default policy).
         self._current = (checkpoint.config, checkpoint.dir) if checkpoint is not None else None
+        # How to build a Policy from (config_name, checkpoint_dir) on reload. Defaults to the plain
+        # Policy this class was originally written for; a caller serving some other Policy subclass
+        # (e.g. serve_policy_with_attention.py's AttentionCapturingPolicy) passes its own factory so
+        # a reload rebuilds the SAME subclass, not a plain Policy that silently drops its extra behavior.
+        self._policy_factory = policy_factory or self._load_plain_policy
 
     @property
     def metadata(self) -> dict:
@@ -101,10 +112,13 @@ class ReloadablePolicy(_base_policy.BasePolicy):
     def reset(self) -> None:
         self._policy.reset()
 
-    def _load(self, config_name: str, checkpoint_dir: str) -> _policy.Policy:
+    def _load_plain_policy(self, config_name: str, checkpoint_dir: str) -> _policy.Policy:
         return _policy_config.create_trained_policy(
             _config.get_config(config_name), checkpoint_dir, default_prompt=self._default_prompt
         )
+
+    def _load(self, config_name: str, checkpoint_dir: str) -> _policy.Policy:
+        return self._policy_factory(config_name, checkpoint_dir)
 
     def _reload(self, request: dict) -> dict:
         config_name, checkpoint_dir = request["config"], request["dir"]
