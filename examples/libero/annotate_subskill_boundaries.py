@@ -38,6 +38,15 @@ state -- not a hand-rolled visual/geometric heuristic:
     onset" heuristic on the recorded `obs/gripper_states`), since that's the
     natural moment transport ends and placing begins.
 
+Optional --label-phases additionally splits each sub-skill's [start_frame,
+end_frame] in half: a "moving" phase (e.g. approaching the object) followed by
+an "interaction" phase (e.g. the actual pick/place/open/close/turn-on), at the
+50% progress point -- added as both a compact `interaction_start_frame` index
+and an explicit per-frame `phase_labels` array (0/1 ints, not bools). Unlike
+the boundaries themselves (each grounded in a real BDDL predicate or
+grasp+lift check), this is a plain time-based split, not a detected event --
+see annotate_demo's own comment for the exact convention.
+
 Replays each demo exactly the way third_party/libero/scripts/create_dataset.py
 does: reset the env with that demo's own randomized `model_file` XML, restore
 the recorded initial `states[0]`, then step through the recorded `actions`
@@ -939,7 +948,7 @@ def _prior_progress_end(joint_trace: dict, first_skill_done: int, min_travel: di
     return events[-1]["frame"], events
 
 
-def annotate_demo(env, demo_group: h5py.Group, task: TaskConfig) -> dict:
+def annotate_demo(env, demo_group: h5py.Group, task: TaskConfig, label_phases: bool = False) -> dict:
     """Note: this replays the demo by teleporting to each frame's recorded
     ground-truth `states[j]` (sim.set_state_from_flattened + sim.forward()),
     NOT by re-stepping the recorded actions through our own controller. An
@@ -1078,6 +1087,31 @@ def annotate_demo(env, demo_group: h5py.Group, task: TaskConfig) -> dict:
         if prior_end is not None:
             boundaries[0]["start_frame"] = prior_end + 1
             result["prior_progress"] = {"end_frame": prior_end, "events": prior_events}
+
+    # Must run LAST, after prior_progress above has had its chance to move
+    # boundaries[0]["start_frame"] forward -- otherwise this would split against a
+    # stale start_frame. Unlike every boundary above (grounded in a real BDDL
+    # predicate or grasp+lift check), this is a plain TIME-based 50% split of each
+    # already-decided [start_frame, end_frame] segment, not a detected physical
+    # event: "moving" (approaching/withdrawing) is the first half of the segment's
+    # frames, "interaction" (the actual pick/place/open/close/turn-on motion) is the
+    # second half.
+    #
+    # Two representations of the same split, both added:
+    #   - interaction_start_frame: the first frame of the interaction half (frames
+    #     [start_frame, interaction_start_frame) are moving, [interaction_start_frame,
+    #     end_frame] are interaction) -- compact, O(1) to check against any frame
+    #     index, no array indexing needed.
+    #   - phase_labels: the literal per-step 0/1 binary label this compact form
+    #     implies, one int (0=moving, 1=interaction, NOT a Python/JSON bool) per
+    #     frame of THIS segment -- len(phase_labels) == end_frame - start_frame + 1,
+    #     phase_labels[k] is frame (start_frame + k)'s label.
+    if label_phases:
+        for b in boundaries:
+            length = b["end_frame"] - b["start_frame"] + 1
+            half = length // 2  # odd length: the extra frame goes to the interaction half
+            b["interaction_start_frame"] = b["start_frame"] + half
+            b["phase_labels"] = [0] * half + [1] * (length - half)
     return result
 
 
@@ -1134,7 +1168,7 @@ def main(args: argparse.Namespace) -> None:
                 for demo_name in demo_names:
                     logging.info(f"  {demo_name} ({len(demo_results) + 1}/{len(demo_names)})...")
                     group = data_grp if demo_name in data_grp else f["data_distractor"]
-                    demo_results[demo_name] = annotate_demo(env, group[demo_name], task)
+                    demo_results[demo_name] = annotate_demo(env, group[demo_name], task, label_phases=args.label_phases)
                     if demo_results[demo_name]["order_anomaly"]:
                         logging.warning(f"  {demo_name}: sub-skill order anomaly (see order_anomaly flag)")
             finally:
@@ -1197,6 +1231,15 @@ if __name__ == "__main__":
     )
     parser.add_argument("--task-filter", default=None, help="Only process HDF5 files whose name contains this substring.")
     parser.add_argument("--max-demos", type=int, default=None, help="Only process the first N demos per task (for quick testing).")
+    parser.add_argument(
+        "--label-phases",
+        action="store_true",
+        help="Also add 'interaction_start_frame' and 'phase_labels' (a 0/1 int per frame of the segment, "
+        "not a bool) to each boundary: a plain time-based 50%% split of its [start_frame, end_frame] into "
+        "a moving phase (first half, e.g. approaching the object) and an interaction phase (second half, "
+        "e.g. the actual pick/place/open/close/turn-on) -- unlike the boundaries themselves, NOT a "
+        "detected physical event. See annotate_demo's own comment for the exact frame convention.",
+    )
     _args = parser.parse_args()
     if not _args.out and not _args.out_per_subdir:
         parser.error("--out is required unless --out-per-subdir is given")
