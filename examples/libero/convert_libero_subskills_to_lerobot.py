@@ -40,6 +40,20 @@ representation:
 this dataset -- pass "absolute" only if converting some other LIBERO-like
 HDF5 source that isn't delta-action).
 
+Every frame also carries a `subskill_done` int64 (0/1, not bool) feature: 0
+for the real start..end frames, 1 for the appended no-op padding frames --
+the padding region itself IS the "sub-skill finished" boundary, so a segment
+stays all-0 if --pad-steps 0 disables padding.
+
+Every frame also carries a `phase` int64 (0/1, not bool) feature: 0 ("moving")
+for the first half of the segment's real frames, 1 ("interaction") for the
+second half, read straight off `annotate_subskill_boundaries.py --label-phases`'s
+per-frame `phase_labels` array (requires the boundaries file to have been
+generated with that flag -- this script errors out naming the offending
+demo/skill if it's missing). Padding frames repeat the segment's last real
+phase value (always 1, since the segment's final frame is always in its
+interaction half).
+
 Usage:
     uv run examples/libero/convert_libero_subskills_to_lerobot.py \
         --data-dir /path/to/libero_10 \
@@ -222,6 +236,14 @@ def main(
             # reference dataset.
             "state": {"dtype": "float32", "shape": (8,), "names": ["state"]},
             "actions": {"dtype": "float32", "shape": (7,), "names": ["actions"]},
+            # 0 for every real frame of the segment, 1 for its appended no-op padding frames
+            # (see module docstring on --pad-steps): the padding IS the "sub-skill finished"
+            # boundary, so this is 0 before it and 1 once the robot has stopped at the end
+            # pose. Stays all-0 for a whole segment if --pad-steps 0 disables padding.
+            "subskill_done": {"dtype": "int64", "shape": (1,), "names": ["subskill_done"]},
+            # 0 ("moving") / 1 ("interaction"), from annotate_subskill_boundaries.py
+            # --label-phases' per-frame phase_labels -- see module docstring.
+            "phase": {"dtype": "int64", "shape": (1,), "names": ["phase"]},
         },
         image_writer_threads=image_writer_threads,
         image_writer_processes=image_writer_processes,
@@ -270,7 +292,23 @@ def main(
                             f"({boundary['prompt']!r}) boundary is a fallback guess, not a confirmed detection"
                         )
 
-                    for i in range(start, end + 1):
+                    phase_labels = boundary.get("phase_labels")
+                    if phase_labels is None:
+                        raise ValueError(
+                            f"{task_path.name}/{demo_key} skill {boundary['skill_idx']} ({boundary['prompt']!r}) "
+                            f"has no phase_labels -- re-run annotate_subskill_boundaries.py with --label-phases "
+                            f"on {source.dir} before converting."
+                        )
+                    if len(phase_labels) != end - start + 1:
+                        raise ValueError(
+                            f"{task_path.name}/{demo_key} skill {boundary['skill_idx']}: phase_labels length "
+                            f"{len(phase_labels)} != segment length {end - start + 1}"
+                        )
+
+                    not_done = np.array([0], dtype=np.int64)
+                    done = np.array([1], dtype=np.int64)
+
+                    for j, i in enumerate(range(start, end + 1)):
                         dataset.add_frame(
                             {
                                 "image": _flip(agentview[i]),
@@ -278,11 +316,14 @@ def main(
                                 "state": states[i],
                                 "actions": actions[i],
                                 "task": boundary["prompt"],
+                                "subskill_done": not_done,
+                                "phase": np.array([phase_labels[j]], dtype=np.int64),
                             }
                         )
                     if pad_steps > 0:
                         pad_image, pad_wrist, pad_state = _flip(agentview[end]), _flip(eye_in_hand[end]), states[end]
                         pad_action = _pad_action(actions[end], action_type)
+                        pad_phase = np.array([phase_labels[-1]], dtype=np.int64)
                         for _ in range(pad_steps):
                             dataset.add_frame(
                                 {
@@ -291,6 +332,8 @@ def main(
                                     "state": pad_state,
                                     "actions": pad_action,
                                     "task": boundary["prompt"],
+                                    "subskill_done": done,
+                                    "phase": pad_phase,
                                 }
                             )
                     dataset.save_episode()
@@ -306,6 +349,7 @@ def main(
                             "start_frame": start,
                             "end_frame": end,
                             "padded_frames": pad_steps,
+                            "interaction_start_frame": boundary.get("interaction_start_frame"),
                         }
                     )
                     num_episodes_written += 1
