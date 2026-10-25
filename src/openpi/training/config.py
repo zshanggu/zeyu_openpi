@@ -308,6 +308,12 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     """
 
     extra_delta_transform: bool = False
+    # Set for datasets converted with convert_libero_subskills_to_lerobot.py's subskill_done/
+    # phase features (e.g. libero90_lilo22_256) -- repacks them through so LiberoInputs can turn
+    # them into Observation.done_label/phase_label for the auxiliary classification heads.
+    # Left off (default) for datasets without these columns, e.g. the public libero release --
+    # repacking a key that doesn't exist in the dataset would KeyError.
+    has_subskill_labels: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -319,19 +325,17 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # For your own dataset, first figure out what keys your environment passes to the policy server
         # and then modify the mappings below so your dataset's keys get matched to those target keys.
         # The repack transform simply remaps key names here.
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/image": "image",
-                        "observation/wrist_image": "wrist_image",
-                        "observation/state": "state",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
-        )
+        repack_structure = {
+            "observation/image": "image",
+            "observation/wrist_image": "wrist_image",
+            "observation/state": "state",
+            "actions": "actions",
+            "prompt": "prompt",
+        }
+        if self.has_subskill_labels:
+            repack_structure["phase"] = "phase"
+            repack_structure["subskill_done"] = "subskill_done"
+        repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_structure)])
 
         # The data transforms are applied to the data coming from the dataset *and* during inference.
         # Below, we define the transforms for data going into the model (``inputs``) and the transforms
@@ -509,6 +513,10 @@ class TrainConfig:
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
     ema_decay: float | None = 0.99
+    # Weight on the auxiliary phase/done classification BCE losses (see pi0.py's compute_loss),
+    # relative to the main flow-matching action loss. Has no effect for a model/dataset with no
+    # such labels (the aux dict is just empty, see LeRobotLiberoDataConfig.has_subskill_labels).
+    aux_loss_weight: float = 0.1
 
     # Specifies which weights should be frozen.
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
@@ -798,6 +806,12 @@ _CONFIGS = [
             discrete_state_input=False,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
+            # Adds the phase/done auxiliary classification heads -- see has_subskill_labels
+            # below, which must be set together with this. These two new nnx.Linear heads sit
+            # outside the llm/action-expert hierarchy, so the LoRA freeze_filter below (which only
+            # matches ".*llm.*" paths) never freezes them -- they stay trainable regardless of the
+            # LoRA freeze, same as in pi05_libero_90_lilo22_full_finetune.
+            use_aux_heads=True,
         ),
         data=LeRobotLiberoDataConfig(
             # repo_id is just an internal identifier here (no $HF_LEROBOT_HOME lookup happens
@@ -805,24 +819,12 @@ _CONFIGS = [
             repo_id="libero_90_lilo22_subskills",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
-            # Hardcoded default (update if you re-convert to a different location) rather than
-            # None: unlike compute_norm_stats.py and train.py (which support --local-root /
-            # --data.local-root overrides via tyro.extras.overridable_config_cli), serve_policy.py
-            # has NO per-field CLI override mechanism at all -- Checkpoint.config is just a plain
-            # string looked up via _config.get_config(), so there's no way to pass an override at
-            # serve time. This value itself is never actually read when serving (norm stats are
-            # loaded from checkpoint_dir/assets/<asset_id>, not from local_root), but local_root
-            # being non-None is what makes asset_id resolve to "meta" (see
-            # DataConfigFactory.create_base_config) instead of repo_id -- matching how every
-            # checkpoint saved during training bundled its norm stats (also under assets/meta/,
-            # for the same reason). If this were left as None, serve_policy.py would look for
-            # assets/libero_90_lilo22_subskills/norm_stats.json instead of assets/meta/norm_stats.json
-            # and fail with a FileNotFoundError (confirmed: this exact mismatch happened before
-            # this default was set).
-            #
-            # You can still override this for compute_norm_stats.py/train.py with
-            # --local-root / --data.local-root pointing at wherever you actually converted to.
-            local_root="/data/zeyu/PHD_LAB/Amazon_Project/lerobot_datasets/your_hf_username/libero_90_lilo22_subskills",
+            # The actual dataset location (converted with convert_libero_subskills_to_lerobot.py's
+            # subskill_done/phase features) -- this is also where compute_norm_stats.py already
+            # wrote meta/norm_stats.json (shared with pi05_libero_90_lilo22_full_finetune, which
+            # points at the same local_root, so no need to recompute norm stats for this config).
+            local_root="/data/zeyu/PHD_LAB/Amazon_Project/lerobot_datasets/libero90_lilo22_256",
+            has_subskill_labels=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         # See pi0_libero_low_mem_finetune above: the freeze filter must use
@@ -841,7 +843,46 @@ _CONFIGS = [
         # parallelism -- ordinary data parallelism, no fsdp_devices change
         # needed for memory here) has real headroom; raise it if you have
         # spare memory, lower it if you hit an OOM.
-        batch_size=32,
+        #
+        # Confirmed batch_size=32 (16/GPU) OOMs during the actual train_step (not init) on these
+        # 2x24GB cards -- needed ~7GB more than the post-rematerialization floor of 17.46GiB.
+        # batch_size=16 (8/GPU) OOM'd too (even slightly worse post-remat floor, likely
+        # compilation variance rather than true batch scaling). Halved again to 8 (4/GPU); raise
+        # again if you move to bigger cards.
+        batch_size=8,
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        # Serving-only sibling of pi05_libero_90_lilo22_low_mem_finetune above, for checkpoints
+        # saved under that SAME checkpoints/<name>/ folder before use_aux_heads=True was added to
+        # it in place (e.g. lilo22_256_2gpu_lora_bs16_memfrac97, my_experiment) -- those on-disk
+        # params have no phase_head/done_head, so loading them through the now-aux-heads name
+        # raises a PyTree-structure-mismatch error from model.load(). Never used for training
+        # (nothing points weight_loader/local_root at a fresh run) -- only exists so
+        # zeyu-Pi0.5Viewer's "Select Model" dialog has a correct config name to type in for those
+        # older checkpoints; the auto-guessed name (read off the path) is always the aux one.
+        name="pi05_libero_90_lilo22_low_mem_finetune_no_aux",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="libero_90_lilo22_subskills",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            local_root="/data/zeyu/PHD_LAB/Amazon_Project/lerobot_datasets/libero90_lilo22_256",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=8,
         num_train_steps=30_000,
     ),
     TrainConfig(
@@ -858,6 +899,10 @@ _CONFIGS = [
             pi05=True,
             action_horizon=10,
             discrete_state_input=False,
+            # Adds the phase/done auxiliary classification heads -- see has_subskill_labels
+            # below, which must be set together with this (the heads need the labels, and vice
+            # versa the labels are wasted without the heads).
+            use_aux_heads=True,
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="libero_90_lilo22_subskills",
@@ -866,8 +911,19 @@ _CONFIGS = [
             # The actual dataset location (not the "your_hf_username" placeholder above) --
             # this is also where compute_norm_stats.py already wrote meta/norm_stats.json.
             local_root="/data/zeyu/PHD_LAB/Amazon_Project/lerobot_datasets/libero90_lilo22_256",
+            # This dataset was (re-)converted with convert_libero_subskills_to_lerobot.py's
+            # subskill_done/phase features -- trains Pi0's auxiliary phase/done classification
+            # heads (see pi0.py's compute_loss) in addition to the normal flow-matching loss.
+            has_subskill_labels=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        # All 3.35B params are trainable here (no freeze_filter), so fp32 Adam state (mu+nu) for
+        # every one of them -- plus the fp32 master params -- is ~40GB total, which even sharded
+        # 2-way doesn't fit in 24GB/GPU with room left for activations (confirmed: OOM'd during
+        # init_train_state before any training step ran). mu_dtype="bfloat16" halves the mu
+        # accumulator (the only one optax lets you downcast), bringing sharded steady-state to
+        # ~16.75GB/GPU.
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0, mu_dtype="bfloat16"),
         fsdp_devices=2,
         batch_size=16,
         num_train_steps=30_000,

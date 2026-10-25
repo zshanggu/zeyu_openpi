@@ -72,6 +72,13 @@ class AdamW(OptimizerConfig):
     # Changing this to 0 can cause out-of-memory errors for some reason, so we set it to a negligible value.
     weight_decay: float = 1e-10
     clip_gradient_norm: float = 1.0
+    # Storage dtype for the first-moment (mu) accumulator, e.g. "bfloat16". Halves that
+    # accumulator's memory footprint at the cost of some precision in the momentum term; the
+    # second moment (nu) and the master params stay fp32 regardless. None (default) keeps mu in
+    # the same dtype as the params (fp32), matching stock optax.adamw behavior. Needed for full
+    # (non-LoRA) fine-tuning of large models on memory-constrained GPUs -- see
+    # pi05_libero_90_lilo22_full_finetune.
+    mu_dtype: str | None = None
 
     def create(
         self,
@@ -79,7 +86,13 @@ class AdamW(OptimizerConfig):
         weight_decay_mask: at.PyTree | None = None,
     ) -> optax.GradientTransformation:
         tx = optax.adamw(
-            lr, b1=self.b1, b2=self.b2, eps=self.eps, weight_decay=self.weight_decay, mask=weight_decay_mask
+            lr,
+            b1=self.b1,
+            b2=self.b2,
+            eps=self.eps,
+            weight_decay=self.weight_decay,
+            mask=weight_decay_mask,
+            mu_dtype=self.mu_dtype,
         )
 
         return optax.chain(optax.clip_by_global_norm(self.clip_gradient_norm), tx)

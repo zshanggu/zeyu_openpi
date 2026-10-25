@@ -105,6 +105,9 @@ class ReloadablePolicy(_base_policy.BasePolicy):
         reload_request = obs.get("_reload_checkpoint")
         if reload_request is not None:
             return self._reload(reload_request)
+        describe_request = obs.get("_describe_config")
+        if describe_request is not None:
+            return self._describe_config(describe_request)
         if self._policy is None:
             raise RuntimeError("No checkpoint loaded (the last reload failed); load one with Select Model")
         return self._policy.infer(obs)
@@ -119,6 +122,60 @@ class ReloadablePolicy(_base_policy.BasePolicy):
 
     def _load(self, config_name: str, checkpoint_dir: str) -> _policy.Policy:
         return self._policy_factory(config_name, checkpoint_dir)
+
+    def _describe_config(self, request: dict) -> dict:
+        """Cheap, read-only lookup of a training config's static model-structure
+        fields -- a pure `config.py` registry lookup, no GPU/model work at all (does
+        NOT touch the currently served policy/checkpoint). Lets a client preview the
+        model structure a config name implies (e.g. `has_aux_heads`) BEFORE
+        committing to an actual (expensive, disruptive) checkpoint reload -- see
+        zeyu-Pi0.5Viewer's "Select Model" modal.
+
+        `want_aux_heads` (optional): if omitted/None, just describes `config_name`
+        exactly, as before. If True/False, the caller wants a config with that exact
+        structure and doesn't care which exact name that is -- e.g. the viewer's
+        "Model structure" selector just wants "whichever config matches this
+        checkpoints/<name>/ folder with aux heads on/off". If `config_name` itself
+        already has the requested structure it's returned as-is; otherwise its
+        "_no_aux" counterpart is tried (the one documented naming convention for a
+        structure fork of the same folder -- see
+        pi05_libero_90_lilo22_low_mem_finetune_no_aux): stripping the suffix if
+        `config_name` has it, or appending it if not. Returns `describe_error` if
+        neither name exists or matches.
+        """
+        config_name = request["config"]
+        want_aux_heads = request.get("want_aux_heads")
+
+        def _use_aux_heads(name: str) -> bool | None:
+            try:
+                train_config = _config.get_config(name)
+            except Exception:  # noqa: BLE001 -- reported to the client, not raised
+                return None
+            return bool(getattr(train_config.model, "use_aux_heads", False))
+
+        has_aux = _use_aux_heads(config_name)
+        if want_aux_heads is None:
+            if has_aux is None:
+                try:
+                    _config.get_config(config_name)
+                except Exception as exc:  # noqa: BLE001 -- reported to the client, not raised
+                    return {"describe_error": str(exc)}
+            return {"described": True, "config": config_name, "has_aux_heads": bool(has_aux)}
+
+        if has_aux is not None and has_aux == want_aux_heads:
+            return {"described": True, "config": config_name, "has_aux_heads": has_aux}
+
+        suffix = "_no_aux"
+        sibling = config_name[: -len(suffix)] if config_name.endswith(suffix) else config_name + suffix
+        sibling_aux = _use_aux_heads(sibling)
+        if sibling_aux == want_aux_heads:
+            return {"described": True, "config": sibling, "has_aux_heads": sibling_aux}
+        return {
+            "describe_error": (
+                f"No config with use_aux_heads={want_aux_heads} found for '{config_name}' "
+                f"(also tried '{sibling}')"
+            )
+        }
 
     def _reload(self, request: dict) -> dict:
         config_name, checkpoint_dir = request["config"], request["dir"]
@@ -144,7 +201,15 @@ class ReloadablePolicy(_base_policy.BasePolicy):
             return {"reload_error": str(exc)}
         self._current = (config_name, checkpoint_dir)
         logging.info("Checkpoint reload complete: config=%s dir=%s", config_name, checkpoint_dir)
-        return {"reloaded": True, "config": config_name, "dir": checkpoint_dir}
+        return {
+            "reloaded": True,
+            "config": config_name,
+            "dir": checkpoint_dir,
+            # Lets the client (zeyu-Pi0.5Viewer) immediately enable/disable its "Show
+            # predicted phase/done labels" Mode-menu toggle for whatever just loaded,
+            # without waiting for a real inference call to confirm it (see policy_config.py).
+            "has_aux_heads": bool(self._policy.metadata.get("has_aux_heads", False)),
+        }
 
 
 # Default checkpoints that should be used for each environment.

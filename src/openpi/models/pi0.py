@@ -7,6 +7,7 @@ import flax.nnx.bridge as nnx_bridge
 from flax.nnx.bridge import variables as _bridge_variables
 import jax
 import jax.numpy as jnp
+import optax
 from typing_extensions import override
 
 from openpi.models import model as _model
@@ -101,6 +102,18 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
+        # Auxiliary classification heads, read off a stop-gradient'd pooled prefix (image +
+        # language) representation -- see compute_loss. Input dim is the PaliGemma backbone's
+        # width (these read the prefix, not the action-expert's suffix), output is a single
+        # logit each. Not covered by get_freeze_filter's LoRA path regexes (new module paths
+        # don't match ".*llm.*"/".*lora.*"), so they always train at full rank.
+        # Gated behind config.use_aux_heads (default False) so stock Pi0/Pi0.5 -- any config that
+        # doesn't opt in -- has NO new params at all and loads every existing checkpoint unchanged.
+        self.has_aux_heads = config.use_aux_heads
+        if self.has_aux_heads:
+            self.phase_head = nnx.Linear(paligemma_config.width, 1, rngs=rngs)
+            self.done_head = nnx.Linear(paligemma_config.width, 1, rngs=rngs)
+
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
@@ -187,10 +200,42 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
 
+    def _aux_classification_losses(
+        self, observation: _model.Observation, prefix_out: at.Float[at.Array, "b s emb"], prefix_mask: at.Bool[at.Array, "b s"]
+    ) -> dict[str, at.Array]:
+        """Phase ("moving"/"interaction") and sub-skill-done BCE losses, read off a
+        stop-gradient'd pooled prefix representation -- see module docstring note in
+        __init__. Only present for datasets with these labels (see Observation.phase_label/
+        done_label); returns {} if neither is present on this observation, so the flow-
+        matching loss/gradient is completely unaffected for any other dataset.
+        """
+        if not self.has_aux_heads or (observation.phase_label is None and observation.done_label is None):
+            return {}
+
+        # Last valid prefix token's hidden state -- it attended bidirectionally to the
+        # whole prefix (images + language), so it's a reasonable single-vector summary.
+        last_idx = jnp.sum(prefix_mask, axis=-1) - 1
+        pooled = jnp.take_along_axis(prefix_out, last_idx[:, None, None], axis=1)[:, 0]
+        # Cut the graph here: these heads must not be able to influence action quality.
+        pooled = jax.lax.stop_gradient(pooled)
+
+        aux = {}
+        if observation.phase_label is not None:
+            label = observation.phase_label.astype(jnp.float32)
+            logit = self.phase_head(pooled)[:, 0]
+            aux["phase_bce"] = optax.sigmoid_binary_cross_entropy(logit, label).mean()
+            aux["phase_acc"] = jnp.mean((logit > 0).astype(jnp.float32) == label)
+        if observation.done_label is not None:
+            label = observation.done_label.astype(jnp.float32)
+            logit = self.done_head(pooled)[:, 0]
+            aux["done_bce"] = optax.sigmoid_binary_cross_entropy(logit, label).mean()
+            aux["done_acc"] = jnp.mean((logit > 0).astype(jnp.float32) == label)
+        return aux
+
     @override
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
-    ) -> at.Float[at.Array, "*b ah"]:
+    ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Array]]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -213,7 +258,8 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        aux_losses = self._aux_classification_losses(observation, prefix_out, prefix_mask)
+        return jnp.mean(jnp.square(v_t - u_t), axis=-1), aux_losses
 
     def _velocity(
         self,
@@ -306,6 +352,73 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    def sample_actions_with_aux_heads(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+    ) -> tuple[_model.Actions, at.Float[at.Array, " b"], at.Float[at.Array, " b"]]:
+        """Like `sample_actions`, but also returns the phase/sub-skill-done auxiliary
+        heads' predicted probabilities, read off the same prefix encoding `sample_actions`
+        already computes to fill its KV cache -- no extra forward pass over
+        `sample_actions` itself, just the two small linear heads applied to the pooled
+        prefix representation (same pooling as `_aux_classification_losses`'s training-time
+        counterpart). Diagnostic/visualization use only -- never used by training or the
+        standard eval path.
+
+        Requires `config.use_aux_heads=True` (`self.has_aux_heads`) -- callers must check
+        that themselves (see `AttentionCapturingPolicy`), since this raises otherwise.
+
+        Returns:
+          - actions: same as `sample_actions`.
+          - phase_prob: sigmoid(phase_head(pooled_prefix)), shape [b], in [0, 1] -- trained
+            as a binary "moving"/"interaction" phase label.
+          - done_prob: sigmoid(done_head(pooled_prefix)), shape [b], in [0, 1] -- trained as
+            the current sub-skill's "done" label.
+        """
+        if not self.has_aux_heads:
+            raise ValueError("sample_actions_with_aux_heads requires config.use_aux_heads=True.")
+        observation = _model.preprocess_observation(None, observation, train=False)
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+
+        # Same pooling as _aux_classification_losses's training-time path: last valid
+        # prefix token (attended bidirectionally over the whole image+language prefix).
+        last_idx = jnp.sum(prefix_mask, axis=-1) - 1
+        pooled = jnp.take_along_axis(prefix_out, last_idx[:, None, None], axis=1)[:, 0]
+        phase_prob = jax.nn.sigmoid(self.phase_head(pooled)[:, 0])
+        done_prob = jax.nn.sigmoid(self.done_head(pooled)[:, 0])
+
+        def step(carry):
+            x_t, time = carry
+            v_t = self._velocity(
+                observation,
+                x_t,
+                time,
+                prefix_tokens=prefix_tokens,
+                prefix_mask=prefix_mask,
+                kv_cache=kv_cache,
+                batch_size=batch_size,
+            )
+            return x_t + dt * v_t, time + dt
+
+        def cond(carry):
+            x_t, time = carry
+            # robust to floating-point error
+            return time >= -dt / 2
+
+        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        return x_0, phase_prob, done_prob
 
     def sample_actions_steered(
         self,
@@ -411,7 +524,8 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
-    ) -> tuple[_model.Actions, at.Array, int]:
+        compute_aux: bool = False,
+    ) -> tuple[_model.Actions, at.Array, int, at.Float[at.Array, " b"] | None, at.Float[at.Array, " b"] | None]:
         """Like `sample_actions`, but also returns the action-expert's attention
         over the prefix (image + language tokens) from the *last* flow-matching
         denoising step.
@@ -428,6 +542,10 @@ class Pi0(_model.BaseModel):
           - prefix_len: number of key/value columns in `attn` that belong to
             the prefix (images + language) -- language occupies the last
             `observation.tokenized_prompt.shape[1]` of those columns.
+          - phase_prob, done_prob: same as `sample_actions_with_aux_heads`'s return
+            values, read off this same prefix encoding (no extra forward pass) --
+            only when `compute_aux=True` AND `self.has_aux_heads`; `None` otherwise
+            (e.g. a stock Pi0/Pi0.5 config with no aux heads at all).
 
         `num_steps` must be a concrete Python int here (unlike `sample_actions`,
         which also accepts a traced array): capturing every denoising step
@@ -450,9 +568,18 @@ class Pi0(_model.BaseModel):
         prefix_len = prefix_tokens.shape[1]
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache, _ = llm_twin.apply(
+        (prefix_out, _), kv_cache, _ = llm_twin.apply(
             llm_variables, [prefix_tokens, None], positions, prefix_attn_mask, method="forward_with_attn"
         )
+
+        phase_prob = done_prob = None
+        if compute_aux and self.has_aux_heads:
+            # Same pooling as _aux_classification_losses's training-time path / as
+            # sample_actions_with_aux_heads -- see either for the resemblance.
+            last_idx = jnp.sum(prefix_mask, axis=-1) - 1
+            pooled = jnp.take_along_axis(prefix_out, last_idx[:, None, None], axis=1)[:, 0]
+            phase_prob = jax.nn.sigmoid(self.phase_head(pooled)[:, 0])
+            done_prob = jax.nn.sigmoid(self.done_head(pooled)[:, 0])
 
         # Precompute the exact shape/dtype of one step's attention array analytically
         # (rather than via an extra warmup forward pass), so it can seed the
@@ -498,4 +625,4 @@ class Pi0(_model.BaseModel):
             return time >= -dt / 2
 
         x_0, _, last_attn = jax.lax.while_loop(cond, step, (noise, 1.0, initial_attn))
-        return x_0, last_attn, prefix_len
+        return x_0, last_attn, prefix_len, phase_prob, done_prob

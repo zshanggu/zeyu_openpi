@@ -88,7 +88,11 @@ def create_trained_policy(
             *repack_transforms.outputs,
         ],
         sample_kwargs=sample_kwargs,
-        metadata=train_config.policy_metadata,
+        # has_aux_heads is derived from the actual loaded model (not just the static config),
+        # so it's always correct even for a config whose model field changes later -- used by
+        # zeyu-Pi0.5Viewer's "Select Model" flow (via ReloadablePolicy._reload's response) to
+        # enable/disable its "Show predicted phase/done labels" Mode-menu toggle.
+        metadata={**(train_config.policy_metadata or {}), "has_aux_heads": bool(getattr(model, "has_aux_heads", False))},
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
     )

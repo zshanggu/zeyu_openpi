@@ -106,6 +106,14 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Optional auxiliary classification labels (0/1), only present for datasets that carry
+    # them (see convert_libero_subskills_to_lerobot.py's subskill_done/phase features) --
+    # None for any other dataset, in which case no auxiliary loss is computed.
+    # Moving (0) vs interaction (1) phase of the current sub-skill.
+    phase_label: at.Int[ArrayT, "*b"] | None = None
+    # Sub-skill not finished (0) vs finished -- in its zero-action padding region (1).
+    done_label: at.Int[ArrayT, "*b"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -126,6 +134,8 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            phase_label=data.get("phase_label"),
+            done_label=data.get("done_label"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -205,6 +215,8 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        phase_label=observation.phase_label,
+        done_label=observation.done_label,
     )
 
 
@@ -277,7 +289,12 @@ class BaseModel(nnx.Module, abc.ABC):
         actions: Actions,
         *,
         train: bool = False,
-    ) -> at.Float[at.Array, "*b ah"]: ...
+    ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Array]]:
+        """Returns (flow-matching loss per [*b, ah], auxiliary scalar losses/metrics dict).
+
+        The aux dict is empty for models/observations with no auxiliary labels -- see Pi0's
+        implementation for the phase/done classification heads.
+        """
 
     @abc.abstractmethod
     def sample_actions(self, rng: at.KeyArrayLike, observation: Observation, **kwargs) -> Actions: ...

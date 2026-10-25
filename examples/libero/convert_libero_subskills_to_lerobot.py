@@ -40,10 +40,14 @@ representation:
 this dataset -- pass "absolute" only if converting some other LIBERO-like
 HDF5 source that isn't delta-action).
 
-Every frame also carries a `subskill_done` int64 (0/1, not bool) feature: 0
-for the real start..end frames, 1 for the appended no-op padding frames --
-the padding region itself IS the "sub-skill finished" boundary, so a segment
-stays all-0 if --pad-steps 0 disables padding.
+Every frame also carries a `subskill_done` int64 (0/1, not bool) feature: 1
+for the segment's last `--done-label-lookback` real frames (default 5) PLUS
+every appended no-op padding frame, 0 for everything before that -- "done" is
+meant to be predictable a little ahead of the actual cut, not only once the
+robot has already stopped at the end pose, so the head gets a short run-up of
+positive examples instead of a single boundary frame. If the real segment is
+shorter than --done-label-lookback, every real frame is 1. Padding frames are
+always 1 regardless of --pad-steps (0 just means there are none to add).
 
 Every frame also carries a `phase` int64 (0/1, not bool) feature: 0 ("moving")
 for the first half of the segment's real frames, 1 ("interaction") for the
@@ -139,6 +143,7 @@ def main(
     output_dir: str | None = None,
     boundaries_file: str | None = None,
     pad_steps: int = 10,
+    done_label_lookback: int = 5,
     action_type: str = "delta",
     image_size: int = 128,
     max_episodes_per_task: int | None = None,
@@ -168,6 +173,9 @@ def main(
             annotate_subskill_boundaries.py writes it by default).
         pad_steps: Number of no-op frames appended to the end of every sub-skill segment
             (see module docstring for why). 0 disables padding.
+        done_label_lookback: Number of real frames at the end of each segment (before any
+            padding) labeled subskill_done=1, in addition to the padding frames themselves
+            (see module docstring).
         action_type: "delta" (default, matches this dataset -- see module docstring) or
             "absolute". Determines what a "stay put" padding action looks like.
         image_size: Camera images are stored at their native resolution (128x128 for the
@@ -236,10 +244,8 @@ def main(
             # reference dataset.
             "state": {"dtype": "float32", "shape": (8,), "names": ["state"]},
             "actions": {"dtype": "float32", "shape": (7,), "names": ["actions"]},
-            # 0 for every real frame of the segment, 1 for its appended no-op padding frames
-            # (see module docstring on --pad-steps): the padding IS the "sub-skill finished"
-            # boundary, so this is 0 before it and 1 once the robot has stopped at the end
-            # pose. Stays all-0 for a whole segment if --pad-steps 0 disables padding.
+            # 1 for the segment's last --done-label-lookback real frames plus every appended
+            # no-op padding frame, 0 before that (see module docstring on --done-label-lookback).
             "subskill_done": {"dtype": "int64", "shape": (1,), "names": ["subskill_done"]},
             # 0 ("moving") / 1 ("interaction"), from annotate_subskill_boundaries.py
             # --label-phases' per-frame phase_labels -- see module docstring.
@@ -307,8 +313,10 @@ def main(
 
                     not_done = np.array([0], dtype=np.int64)
                     done = np.array([1], dtype=np.int64)
+                    segment_len = end - start + 1
 
                     for j, i in enumerate(range(start, end + 1)):
+                        is_done = (segment_len - j) <= done_label_lookback
                         dataset.add_frame(
                             {
                                 "image": _flip(agentview[i]),
@@ -316,7 +324,7 @@ def main(
                                 "state": states[i],
                                 "actions": actions[i],
                                 "task": boundary["prompt"],
-                                "subskill_done": not_done,
+                                "subskill_done": done if is_done else not_done,
                                 "phase": np.array([phase_labels[j]], dtype=np.int64),
                             }
                         )

@@ -98,6 +98,34 @@ LIFT_THRESHOLD_M = 0.015  # object must rise this much above its resting height 
 # fixed by any threshold and correctly falls back to detection_failed=True.
 RELEASE_DELTA_M = 0.004
 
+# turnon(flat_stove_*) boundaries (see _stove_lit_frame): how far past the predicate's own
+# detected frame to keep searching the recorded video for the burner actually showing red, before
+# giving up and leaving the predicate's frame unchanged. Spot-checked gaps between the predicate
+# and the visual cue ranged from -12 (video already shows red 12 frames before the predicate fires)
+# to +1 (video lags the predicate by a single frame) across a handful of KITCHEN_SCENE3/9 demos --
+# the search itself starts at frame 0 regardless (so an earlier visual cue is always found), this
+# margin only bounds how far past the predicate frame a late one is chased.
+TURNON_VISUAL_SEARCH_MARGIN = 20
+# A burner that's off contributes 0-2 of these high-saturation-red pixels in real demos checked so
+# far (background/prop noise); a lit one contributes roughly 250-270 (the red ring itself). 50 sits
+# comfortably between the two. Not a learned detector -- just a plain pixel-color heuristic, so a
+# red prop placed right where a burner would be could in principle false-positive; spot-check new
+# task layouts if one is ever added.
+STOVE_RED_PIXEL_THRESHOLD = 50
+
+
+def _stove_lit_frame(agentview_rgb: np.ndarray, search_start: int, search_end: int) -> int | None:
+    """First frame index in [search_start, search_end] (inclusive) whose recorded image shows a
+    stove burner lit red, or None if none in that range does."""
+    for i in range(search_start, search_end + 1):
+        frame = agentview_rgb[i].astype(np.int16)
+        r, g, b = frame[..., 0], frame[..., 1], frame[..., 2]
+        red_mask = (r > 150) & (r - g > 60) & (r - b > 60)
+        if int(red_mask.sum()) > STOVE_RED_PIXEL_THRESHOLD:
+            return i
+    return None
+
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 BDDL_FILES_ROOT = REPO_ROOT / "third_party/libero/libero/libero/bddl_files"
 
@@ -1016,6 +1044,27 @@ def annotate_demo(env, demo_group: h5py.Group, task: TaskConfig, label_phases: b
         if track_prior:
             for k in art_keys:
                 joint_trace[k].append(env.object_states_dict[k].get_joint_state())
+
+    # turnon(flat_stove_*) boundaries: the qpos-threshold predicate above replays cleanly against
+    # the recorded ground-truth state, but that state and the recorded video frame at the SAME
+    # index don't always depict the same moment (confirmed directly against real demos -- not a
+    # constant offset, varies by source HDF5 in both direction and size), so the predicate's frame
+    # can land before the video visually shows the burner lit. Override it with the video's own
+    # evidence wherever we can find it -- search from frame 0 (so an earlier visual cue is always
+    # picked up) through TURNON_VISUAL_SEARCH_MARGIN frames past the predicate's own frame (so a
+    # later one still gets found); leave the predicate's frame unchanged if the video never shows
+    # red anywhere in that range (keeps the original behavior rather than guessing).
+    turnon_keys = [k for k, e in direct_events.items() if isinstance(e, PredicateEvent) and e.name == "turnon"]
+    if turnon_keys and any(completion_frame[k] is not None for k in turnon_keys):
+        agentview_rgb = np.asarray(demo_group["obs"]["agentview_rgb"])
+        for key in turnon_keys:
+            if completion_frame[key] is None:
+                continue
+            search_end = min(num_frames, agentview_rgb.shape[0]) - 1
+            search_end = min(search_end, completion_frame[key] + TURNON_VISUAL_SEARCH_MARGIN)
+            visual_frame = _stove_lit_frame(agentview_rgb, 0, search_end)
+            if visual_frame is not None:
+                completion_frame[key] = visual_frame
 
     # Resolve ReleaseOnsetEvent skills now that direct events are known: first
     # frame, strictly after the referenced skill's completion, where the

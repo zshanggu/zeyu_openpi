@@ -80,6 +80,15 @@ class LiberoInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        # Optional per-frame auxiliary classification labels (0/1), only present for
+        # datasets converted with annotate_subskill_boundaries.py's --label-phases and
+        # convert_libero_subskills_to_lerobot.py's subskill_done/phase features -- absent
+        # (and silently skipped) for any other dataset, e.g. the public libero release.
+        if "phase" in data:
+            inputs["phase_label"] = np.asarray(data["phase"]).squeeze().astype(np.int32)
+        if "subskill_done" in data:
+            inputs["done_label"] = np.asarray(data["subskill_done"]).squeeze().astype(np.int32)
+
         return inputs
 
 

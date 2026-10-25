@@ -32,6 +32,13 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Off by default: this is the only difference from the original (unmodified) Pi0/Pi0.5
+    # architecture -- when False, no phase_head/done_head are created at all, so the model is
+    # byte-for-byte identical in structure to stock Pi0/Pi0.5 and loads any existing checkpoint
+    # unchanged. Set True only for a TrainConfig whose dataset actually carries phase/done labels
+    # (see LeRobotLiberoDataConfig.has_subskill_labels) -- see Pi0.compute_loss for what this adds.
+    use_aux_heads: bool = False
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
