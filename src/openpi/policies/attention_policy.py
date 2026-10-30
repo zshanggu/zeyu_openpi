@@ -28,7 +28,7 @@ from openpi.shared import nnx_utils
 
 class AttentionCapturingPolicy(_policy.Policy):
     """Like `Policy`, but `infer()` also returns `attn` and `prefix_len`, and --
-    for a model with `config.use_aux_heads=True` -- `phase_prob`/`done_prob`.
+    for a model with `config.aux_signal_mode=="classification_head"` -- `phase_prob`/`done_prob`.
 
     Requires a JAX Pi0/Pi0.5 model (the model's `sample_actions_with_attention`,
     currently only implemented on `openpi.models.pi0.Pi0`). `actions`/`state` in
@@ -75,7 +75,7 @@ class AttentionCapturingPolicy(_policy.Policy):
       - phase_prob, done_prob: float in [0, 1], the phase/sub-skill-done
         auxiliary heads' predicted probabilities (see
         `pi0.Pi0.sample_actions_with_aux_heads`) -- only present when the served
-        model has `config.use_aux_heads=True` AND `_compute_aux_heads` is
+        model has `config.aux_signal_mode=="classification_head"` AND `_compute_aux_heads` is
         truthy (see below). Absent (not just False/None -- the keys don't exist
         at all) for any model trained without these heads, so a client should
         use `.get(...)`/`in` to tell "no aux heads on this checkpoint" apart

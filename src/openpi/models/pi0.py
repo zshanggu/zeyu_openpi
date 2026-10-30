@@ -107,9 +107,10 @@ class Pi0(_model.BaseModel):
         # width (these read the prefix, not the action-expert's suffix), output is a single
         # logit each. Not covered by get_freeze_filter's LoRA path regexes (new module paths
         # don't match ".*llm.*"/".*lora.*"), so they always train at full rank.
-        # Gated behind config.use_aux_heads (default False) so stock Pi0/Pi0.5 -- any config that
-        # doesn't opt in -- has NO new params at all and loads every existing checkpoint unchanged.
-        self.has_aux_heads = config.use_aux_heads
+        # Only created for aux_signal_mode=="classification_head" -- "none" and "action_dim" have
+        # NO new params at all and load every existing (pre-aux-heads) checkpoint unchanged.
+        self.aux_signal_mode = config.aux_signal_mode
+        self.has_aux_heads = config.aux_signal_mode == "classification_head"
         if self.has_aux_heads:
             self.phase_head = nnx.Linear(paligemma_config.width, 1, rngs=rngs)
             self.done_head = nnx.Linear(paligemma_config.width, 1, rngs=rngs)
@@ -259,6 +260,16 @@ class Pi0(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
         aux_losses = self._aux_classification_losses(observation, prefix_out, prefix_mask)
+        if self.aux_signal_mode == "action_dim":
+            # Read-only diagnostics -- phase/done ride as actions[..., 7]/[..., 8] (see
+            # LeRobotLiberoDataConfig.subskill_aux_mode) and are already covered by the main
+            # velocity-matching loss below, so these don't feed back into any gradient; they
+            # just let you watch those two channels' error separately from the real action dims.
+            aux_losses = {
+                **aux_losses,
+                "phase_dim_mse": jnp.mean(jnp.square(v_t[..., 7] - u_t[..., 7])),
+                "done_dim_mse": jnp.mean(jnp.square(v_t[..., 8] - u_t[..., 8])),
+            }
         return jnp.mean(jnp.square(v_t - u_t), axis=-1), aux_losses
 
     def _velocity(
@@ -369,8 +380,9 @@ class Pi0(_model.BaseModel):
         counterpart). Diagnostic/visualization use only -- never used by training or the
         standard eval path.
 
-        Requires `config.use_aux_heads=True` (`self.has_aux_heads`) -- callers must check
-        that themselves (see `AttentionCapturingPolicy`), since this raises otherwise.
+        Requires `config.aux_signal_mode=="classification_head"` (`self.has_aux_heads`) --
+        callers must check that themselves (see `AttentionCapturingPolicy`), since this raises
+        otherwise.
 
         Returns:
           - actions: same as `sample_actions`.
@@ -380,7 +392,7 @@ class Pi0(_model.BaseModel):
             the current sub-skill's "done" label.
         """
         if not self.has_aux_heads:
-            raise ValueError("sample_actions_with_aux_heads requires config.use_aux_heads=True.")
+            raise ValueError('sample_actions_with_aux_heads requires config.aux_signal_mode=="classification_head".')
         observation = _model.preprocess_observation(None, observation, train=False)
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]

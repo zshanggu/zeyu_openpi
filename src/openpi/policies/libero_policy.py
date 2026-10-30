@@ -101,9 +101,33 @@ class LiberoOutputs(transforms.DataTransformFn):
     For your own dataset, you can copy this class and modify the action dimension based on the comments below.
     """
 
+    # Set for a model/data config pair with aux_signal_mode/subskill_aux_mode=="action_dim" --
+    # the sampled "actions" chunk is then 9-dim (7 real + phase + done, see
+    # LeRobotLiberoDataConfig.subskill_aux_mode), and this splits the extra 2 back out into
+    # phase_prob/done_prob (named to match the classification_head mode's aux output keys),
+    # instead of silently sending them to the robot as extra motor commands.
+    has_action_dim_aux: bool = False
+
     def __call__(self, data: dict) -> dict:
         # Only return the first N actions -- since we padded actions above to fit the model action
         # dimension, we need to now parse out the correct number of actions in the return dict.
         # For Libero, we only return the first 7 actions (since the rest is padding).
         # For your own dataset, replace `7` with the action dimension of your dataset.
-        return {"actions": np.asarray(data["actions"][..., :7])}
+        actions = np.asarray(data["actions"])
+        outputs = {"actions": actions[..., :7]}
+        if self.has_action_dim_aux:
+            # `actions` here is the full (action_horizon, model_action_dim) chunk (the caller
+            # already squeezed the batch dim -- see policy.py's/attention_policy.py's own
+            # `x[0, ...]`), so actions[..., 7]/[..., 8] are themselves still one whole
+            # action_horizon-length sequence, not a scalar -- unlike the classification_head
+            # mode's phase_prob/done_prob, which are a single pooled judgment about the CURRENT
+            # frame. Take just the first (soonest) predicted step so the wire contract stays a
+            # single float either way, and cast off numpy's scalar type (float32 isn't JSON
+            # serializable; plain Python float is). Raw regressed values, not
+            # sigmoid-calibrated probabilities -- trained directly against hard 0/1 targets via
+            # the flow-matching velocity loss, so they cluster near 0/1 but aren't a true
+            # probability. Named the same as the classification_head mode's keys for a common
+            # consumer-side interface.
+            outputs["phase_prob"] = float(actions[0, 7])
+            outputs["done_prob"] = float(actions[0, 8])
+        return outputs

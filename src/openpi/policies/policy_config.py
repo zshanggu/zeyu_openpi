@@ -88,11 +88,20 @@ def create_trained_policy(
             *repack_transforms.outputs,
         ],
         sample_kwargs=sample_kwargs,
-        # has_aux_heads is derived from the actual loaded model (not just the static config),
-        # so it's always correct even for a config whose model field changes later -- used by
-        # zeyu-Pi0.5Viewer's "Select Model" flow (via ReloadablePolicy._reload's response) to
-        # enable/disable its "Show predicted phase/done labels" Mode-menu toggle.
-        metadata={**(train_config.policy_metadata or {}), "has_aux_heads": bool(getattr(model, "has_aux_heads", False))},
+        # Derived from the actual loaded model (not just the static config), so always correct
+        # even for a config whose model field changes later -- used by zeyu-Pi0.5Viewer's
+        # "Select Model" flow (via ReloadablePolicy._reload's response) to enable/disable its
+        # "Show predicted phase/done labels" Mode-menu toggle. has_aux_heads is kept (rather than
+        # just aux_signal_mode) for that one existing consumer that only cares about the
+        # classification_head mechanism specifically (AttentionCapturingPolicy's JIT'd
+        # sample_actions_with_aux_heads path); aux_signal_mode additionally distinguishes
+        # "action_dim" (phase/done ride on `actions` itself -- no separate heads/sampling path,
+        # but LiberoOutputs still emits the same phase_prob/done_prob keys) from "none".
+        metadata={
+            **(train_config.policy_metadata or {}),
+            "has_aux_heads": bool(getattr(model, "has_aux_heads", False)),
+            "aux_signal_mode": getattr(model, "aux_signal_mode", "none"),
+        },
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
     )

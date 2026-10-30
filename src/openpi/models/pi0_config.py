@@ -1,4 +1,5 @@
 import dataclasses
+import typing
 from typing import TYPE_CHECKING
 
 import flax.nnx as nnx
@@ -32,12 +33,19 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
-    # Off by default: this is the only difference from the original (unmodified) Pi0/Pi0.5
-    # architecture -- when False, no phase_head/done_head are created at all, so the model is
-    # byte-for-byte identical in structure to stock Pi0/Pi0.5 and loads any existing checkpoint
-    # unchanged. Set True only for a TrainConfig whose dataset actually carries phase/done labels
-    # (see LeRobotLiberoDataConfig.has_subskill_labels) -- see Pi0.compute_loss for what this adds.
-    use_aux_heads: bool = False
+    # "none" (default) is byte-for-byte identical in structure to stock Pi0/Pi0.5 -- no new
+    # params, loads any existing checkpoint unchanged. The other two modes are two different ways
+    # of teaching the model the moving/interaction phase label and the sub-skill-done label (see
+    # LeRobotLiberoDataConfig.subskill_aux_mode, which must be set to the same value):
+    #   - "classification_head": two small nnx.Linear heads read a stop-gradient'd pooled prefix
+    #     representation and are trained with their own BCE loss (see Pi0.compute_loss /
+    #     _aux_classification_losses) -- isolated from action quality, but a single hard
+    #     per-frame binary target.
+    #   - "action_dim": phase/done ride as two extra dims on `actions` itself (LIBERO only uses
+    #     7 of the 32 padded action_dim slots, so this costs no capacity) and are learned by the
+    #     same flow-matching velocity loss as the real action dims -- no stop-gradient isolation,
+    #     but gets action_horizon-many steps of temporal context instead of a single-frame guess.
+    aux_signal_mode: typing.Literal["none", "classification_head", "action_dim"] = "none"
 
     pytorch_compile_mode: str | None = "max-autotune"
 

@@ -151,7 +151,7 @@ class ReloadablePolicy(_base_policy.BasePolicy):
                 train_config = _config.get_config(name)
             except Exception:  # noqa: BLE001 -- reported to the client, not raised
                 return None
-            return bool(getattr(train_config.model, "use_aux_heads", False))
+            return getattr(train_config.model, "aux_signal_mode", "none") == "classification_head"
 
         has_aux = _use_aux_heads(config_name)
         if want_aux_heads is None:
@@ -208,7 +208,11 @@ class ReloadablePolicy(_base_policy.BasePolicy):
             # Lets the client (zeyu-Pi0.5Viewer) immediately enable/disable its "Show
             # predicted phase/done labels" Mode-menu toggle for whatever just loaded,
             # without waiting for a real inference call to confirm it (see policy_config.py).
+            # aux_signal_mode is the general form -- "none"/"classification_head"/"action_dim"
+            # -- has_aux_heads is kept alongside it only because it's the one already-shipped
+            # field name an older client might still read.
             "has_aux_heads": bool(self._policy.metadata.get("has_aux_heads", False)),
+            "aux_signal_mode": self._policy.metadata.get("aux_signal_mode", "none"),
         }
 
 

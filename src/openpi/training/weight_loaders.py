@@ -51,7 +51,7 @@ class CheckpointWeightLoader(WeightLoader):
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
         # Add all missing LoRA weights, plus the optional aux classification heads (phase_head/
-        # done_head, see Pi0Config.use_aux_heads) -- neither exists in any pre-existing checkpoint,
+        # done_head, see Pi0Config.aux_signal_mode) -- neither exists in any pre-existing checkpoint,
         # so both are always "missing" and get filled in from the fresh-init reference params. A
         # no-op for any model that doesn't have them (the pattern just matches nothing).
         return _merge_params(loaded_params, params, missing_regex=".*(lora|phase_head|done_head).*")

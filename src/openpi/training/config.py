@@ -194,9 +194,13 @@ class DataConfigFactory(abc.ABC):
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
         asset_id = self.assets.asset_id or repo_id
         if self.local_root is not None:
-            # local_root fixes both where the dataset itself lives AND where its norm stats
-            # live (its own meta/ subdirectory), overriding any separate AssetsConfig.
-            norm_stats_dir, asset_id = epath.Path(self.local_root), "meta"
+            # local_root fixes where the dataset itself lives AND, by default, where its norm
+            # stats live (its own meta/ subdirectory) -- but an explicit AssetsConfig.asset_id
+            # still overrides that subdirectory name, so two TrainConfigs that share one
+            # local_root (e.g. different aux_signal_mode/subskill_aux_mode, hence a different
+            # `actions` dim) can keep separate norm_stats.json files instead of clobbering
+            # each other's.
+            norm_stats_dir, asset_id = epath.Path(self.local_root), (self.assets.asset_id or "meta")
         else:
             norm_stats_dir = epath.Path(self.assets.assets_dir or assets_dirs)
         return dataclasses.replace(
@@ -308,12 +312,18 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     """
 
     extra_delta_transform: bool = False
-    # Set for datasets converted with convert_libero_subskills_to_lerobot.py's subskill_done/
-    # phase features (e.g. libero90_lilo22_256) -- repacks them through so LiberoInputs can turn
-    # them into Observation.done_label/phase_label for the auxiliary classification heads.
-    # Left off (default) for datasets without these columns, e.g. the public libero release --
-    # repacking a key that doesn't exist in the dataset would KeyError.
-    has_subskill_labels: bool = False
+    # Must match the model's Pi0Config.aux_signal_mode. Both read the SAME columns written by
+    # convert_libero_subskills_to_lerobot.py (phase/subskill_done/actions_with_aux) -- absent
+    # (and silently skipped) for any dataset without these columns, e.g. the public libero
+    # release, where repacking a key that doesn't exist would KeyError:
+    #   - "none": no repack at all, actions stay the dataset's plain 7-dim "actions" column.
+    #   - "classification_head": repacks "phase"/"subskill_done" through so LiberoInputs can
+    #     turn them into Observation.phase_label/done_label for the auxiliary classification
+    #     heads. actions stay 7-dim.
+    #   - "action_dim": repacks the dataset's 9-dim "actions_with_aux" column (actions ++
+    #     phase ++ subskill_done) in as "actions" itself -- see LiberoOutputs.has_action_dim_aux
+    #     for how inference splits the extra 2 dims back out.
+    subskill_aux_mode: Literal["none", "classification_head", "action_dim"] = "none"
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -332,10 +342,20 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             "actions": "actions",
             "prompt": "prompt",
         }
-        if self.has_subskill_labels:
+        if self.subskill_aux_mode == "classification_head":
             repack_structure["phase"] = "phase"
             repack_structure["subskill_done"] = "subskill_done"
+        elif self.subskill_aux_mode == "action_dim":
+            repack_structure["actions"] = "actions_with_aux"
         repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_structure)])
+
+        # action_sequence_keys tells the data loader which RAW dataset column to chunk into an
+        # action_horizon-length window (see data_loader.py's delta_timestamps) -- must name
+        # whichever column repack_structure above actually reads "actions" from, or the wrong
+        # column gets chunked (the default "actions") while the one repack grabs
+        # ("actions_with_aux") arrives as a single unchunked frame, silently dropping the
+        # action_horizon dimension.
+        action_sequence_keys = ("actions_with_aux",) if self.subskill_aux_mode == "action_dim" else ("actions",)
 
         # The data transforms are applied to the data coming from the dataset *and* during inference.
         # Below, we define the transforms for data going into the model (``inputs``) and the transforms
@@ -345,7 +365,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # replace the transforms below with your own.
         data_transforms = _transforms.Group(
             inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
-            outputs=[libero_policy.LiberoOutputs()],
+            outputs=[libero_policy.LiberoOutputs(has_action_dim_aux=self.subskill_aux_mode == "action_dim")],
         )
 
         # One additional data transform: pi0 models are trained on delta actions (relative to the first
@@ -377,6 +397,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            action_sequence_keys=action_sequence_keys,
         )
 
 
@@ -806,12 +827,12 @@ _CONFIGS = [
             discrete_state_input=False,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
-            # Adds the phase/done auxiliary classification heads -- see has_subskill_labels
-            # below, which must be set together with this. These two new nnx.Linear heads sit
+            # Adds the phase/done auxiliary classification heads -- see subskill_aux_mode
+            # below, which must be set to the SAME value. These two new nnx.Linear heads sit
             # outside the llm/action-expert hierarchy, so the LoRA freeze_filter below (which only
             # matches ".*llm.*" paths) never freezes them -- they stay trainable regardless of the
             # LoRA freeze, same as in pi05_libero_90_lilo22_full_finetune.
-            use_aux_heads=True,
+            aux_signal_mode="classification_head",
         ),
         data=LeRobotLiberoDataConfig(
             # repo_id is just an internal identifier here (no $HF_LEROBOT_HOME lookup happens
@@ -820,11 +841,12 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
             # The actual dataset location (converted with convert_libero_subskills_to_lerobot.py's
-            # subskill_done/phase features) -- this is also where compute_norm_stats.py already
-            # wrote meta/norm_stats.json (shared with pi05_libero_90_lilo22_full_finetune, which
-            # points at the same local_root, so no need to recompute norm stats for this config).
+            # subskill_done/phase/actions_with_aux features) -- this is also where
+            # compute_norm_stats.py already wrote meta/norm_stats.json (shared with
+            # pi05_libero_90_lilo22_full_finetune, which points at the same local_root AND the
+            # same subskill_aux_mode, so no need to recompute norm stats for this config).
             local_root="/data/zeyu/PHD_LAB/Amazon_Project/lerobot_datasets/libero90_lilo22_256",
-            has_subskill_labels=True,
+            subskill_aux_mode="classification_head",
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         # See pi0_libero_low_mem_finetune above: the freeze filter must use
@@ -853,8 +875,50 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     TrainConfig(
+        # Same LoRA/hardware setup as pi05_libero_90_lilo22_low_mem_finetune above, but phase/done
+        # ride as 2 extra dims on `actions` itself (LIBERO only uses 7 of the model's 32 padded
+        # action_dim slots) instead of separate classification heads -- see Pi0Config
+        # .aux_signal_mode's docstring for the tradeoff. Switch between the three variants
+        # (this one, the classification_head one above, and the plain-Pi0.5 "_no_aux" one below)
+        # purely by picking a different config_name on the scripts/train.py command line; all
+        # three read the SAME converted dataset (convert_libero_subskills_to_lerobot.py always
+        # writes all of actions/phase/subskill_done/actions_with_aux now).
+        name="pi05_libero_90_lilo22_low_mem_finetune_action_dim_aux",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            aux_signal_mode="action_dim",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="libero_90_lilo22_subskills",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            local_root="/data/zeyu/PHD_LAB/Amazon_Project/lerobot_datasets/libero90_lilo22_256",
+            subskill_aux_mode="action_dim",
+            # `actions` here is 9-dim (7 real + phase + done), vs. 7-dim for the
+            # classification_head/none configs above that share this SAME local_root -- norm
+            # stats can't be shared (different "actions" shape), so this gets its own
+            # norm_stats.json subdirectory instead of the default "meta" one. Must re-run
+            # compute_norm_stats.py --config-name pi05_libero_90_lilo22_low_mem_finetune_action_dim_aux
+            # once before training with this config for the first time.
+            assets=AssetsConfig(asset_id="meta_action_dim_aux"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=8,
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
         # Serving-only sibling of pi05_libero_90_lilo22_low_mem_finetune above, for checkpoints
-        # saved under that SAME checkpoints/<name>/ folder before use_aux_heads=True was added to
+        # saved under that SAME checkpoints/<name>/ folder before aux_signal_mode was added to
         # it in place (e.g. lilo22_256_2gpu_lora_bs16_memfrac97, my_experiment) -- those on-disk
         # params have no phase_head/done_head, so loading them through the now-aux-heads name
         # raises a PyTree-structure-mismatch error from model.load(). Never used for training
@@ -899,10 +963,10 @@ _CONFIGS = [
             pi05=True,
             action_horizon=10,
             discrete_state_input=False,
-            # Adds the phase/done auxiliary classification heads -- see has_subskill_labels
-            # below, which must be set together with this (the heads need the labels, and vice
+            # Adds the phase/done auxiliary classification heads -- see subskill_aux_mode
+            # below, which must be set to the SAME value (the heads need the labels, and vice
             # versa the labels are wasted without the heads).
-            use_aux_heads=True,
+            aux_signal_mode="classification_head",
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="libero_90_lilo22_subskills",
@@ -914,7 +978,7 @@ _CONFIGS = [
             # This dataset was (re-)converted with convert_libero_subskills_to_lerobot.py's
             # subskill_done/phase features -- trains Pi0's auxiliary phase/done classification
             # heads (see pi0.py's compute_loss) in addition to the normal flow-matching loss.
-            has_subskill_labels=True,
+            subskill_aux_mode="classification_head",
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         # All 3.35B params are trainable here (no freeze_filter), so fp32 Adam state (mu+nu) for
