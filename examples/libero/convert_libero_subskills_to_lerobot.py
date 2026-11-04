@@ -58,6 +58,18 @@ demo/skill if it's missing). Padding frames repeat the segment's last real
 phase value (always 1, since the segment's final frame is always in its
 interaction half).
 
+Also writes `meta/boundary_orientations.json`: per sub-skill (keyed by its own
+`boundary["prompt"]`, exactly as it appears in `meta/tasks.jsonl`), every demo's
+gripper orientation (quaternion, xyzw, world frame -- converted from
+`obs["ee_states"]`'s own axis-angle orientation, the SAME array `state` is built
+from above) at that sub-skill's own moving/interaction boundary frame
+(`boundary["interaction_start_frame"]`). This is mined HERE, during conversion,
+rather than by a separate post-hoc pass over the finished dataset, so consuming
+projects (e.g. zeyu-Pi0.5Viewer's Auto Steer, which uses this to correct steering
+toward a sub-skill's own characteristic grasp pose instead of assuming vertical)
+never need direct access to this -- often large -- dataset at all, only this one
+small metadata file.
+
 Usage:
     uv run examples/libero/convert_libero_subskills_to_lerobot.py \
         --data-dir /path/to/libero_10 \
@@ -124,6 +136,17 @@ def _flip(img: np.ndarray) -> np.ndarray:
     # obs["agentview_image"][::-1, ::-1] (both axes, not just one -- a single-axis flip
     # left training images mirrored relative to what the model actually sees at eval time).
     return np.ascontiguousarray(img[::-1, ::-1])
+
+
+def _axisangle_to_quat_xyzw(aa: np.ndarray) -> list[float]:
+    """World-frame axis-angle (radians, this dataset's own `state[3:6]` convention) ->
+    unit quaternion (xyzw) -- used only for meta/boundary_orientations.json (see module
+    docstring); `state` itself keeps the axis-angle representation unchanged."""
+    angle = float(np.linalg.norm(aa))
+    if angle < 1e-9:
+        return [0.0, 0.0, 0.0, 1.0]
+    axis = aa / angle
+    return [*(axis * np.sin(angle / 2.0)).tolist(), float(np.cos(angle / 2.0))]
 
 
 def _pad_action(last_action: np.ndarray, action_type: str) -> np.ndarray:
@@ -267,6 +290,8 @@ def main(
     num_demos_skipped = 0
     num_segments_skipped_failed = 0
     episode_source: list[dict] = []  # provenance of every written episode -> meta/episode_source.jsonl
+    # Per-sub-skill boundary-orientation samples -> meta/boundary_orientations.json (see module docstring).
+    boundary_orientations: dict[str, list[list[float]]] = {}
     wanted_groups = {"standard": ["data"], "distractor": ["data_distractor"], "both": ["data", "data_distractor"]}[groups]
     work = [(g, src, tp) for g in wanted_groups for src in sources for tp in src.task_paths]  # group-major order
     for group_name, source, task_path in tqdm.tqdm(work, desc="task files"):
@@ -362,6 +387,11 @@ def main(
                                 }
                             )
                     dataset.save_episode()
+                    interaction_start_frame = boundary.get("interaction_start_frame")
+                    if interaction_start_frame is not None:
+                        boundary_orientations.setdefault(boundary["prompt"], []).append(
+                            _axisangle_to_quat_xyzw(states[interaction_start_frame][3:6])
+                        )
                     episode_source.append(
                         {
                             "episode_index": num_episodes_written,
@@ -389,6 +419,7 @@ def main(
         merge_info["by_source_and_group"][key] = merge_info["by_source_and_group"].get(key, 0) + 1
     (output_path / "meta" / "merge_info.json").write_text(json.dumps(merge_info, indent=2))
     (output_path / "meta" / "episode_source.jsonl").write_text("".join(json.dumps(r) + "\n" for r in episode_source))
+    (output_path / "meta" / "boundary_orientations.json").write_text(json.dumps(boundary_orientations, indent=2))
     print(
         f"Wrote {num_episodes_written} sub-skill episodes ({num_demos_skipped} demos skipped, not in {boundaries_path.name}"
         f"; {num_segments_skipped_failed} segments skipped for failed detection; {len(sources)} source dir(s))"
