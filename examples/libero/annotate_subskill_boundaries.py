@@ -778,6 +778,53 @@ LILO22_WOODEN_CABINET_CONFIGS: list[TaskConfig] = [
         bddl_subdir=WOODEN_CABINET_BDDL_DIR,
         label_to_episode_end=False,
     ),
+    TaskConfig(
+        # MimicGen-generated, wine-rack-removed, full-Y-range variant (zeyu-mimicgen/
+        # mimicgen_libero_bridge/run_kitchen4_bowl_drawer_norack.py). Its own bddl
+        # (not the stock KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet.bddl
+        # in bddl_wooden_cabinet/, which still has the wine_rack and a half-range cabinet
+        # region) lives directly in bddl_wooden_cabinet/, hence bddl_subdir="" (absolute).
+        hdf5_name="KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_norack_wooden_cabinet_demo.hdf5",
+        bddl_name="KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_norack.bddl",
+        skills=[
+            SkillSpec("Pick Black Bowl", GraspEvent("akita_black_bowl_1")),
+            SkillSpec("Place Black Bowl in Bottom Drawer", PredicateEvent("in", ("akita_black_bowl_1", "wooden_cabinet_1_bottom_region"))),
+        ],
+        bddl_subdir=os.environ.get(
+            "LILO22_WOODEN_CABINET_NORACK_BDDL_DIR",
+            "/data/zeyu/PHD_LAB/Amazon_Project/libero_rerender_script/bddl_wooden_cabinet",
+        ),
+    ),
+]
+
+# --- The MimicGen-generated LIBERO-90 tasks in libero_modified_hdf5/libero90_openvla_256_mimicgen,
+# written by the various zeyu-mimicgen/mimicgen_libero_bridge/run_*.py scripts this session. Most
+# reuse the exact scene topology of their stock LIBERO_90_LILO22_CONFIGS counterpart (same fixture/
+# site names -- only the moving object's placement range differs, controlled at runtime, not via a
+# different bddl), so they're safe to label with that SAME global registry. Exactly one collides:
+# KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_demo.hdf5 also exists as a
+# native/stock recording (used by libero90_openvla_256_ori/); the MimicGen copy of that filename
+# was instead generated from the WIDENED wooden_cabinet bddl (run_kitchen4_bowl_drawer_wide.py),
+# so it needs wooden_cabinet_1_bottom_region, not white_cabinet_1_bottom_region, and a different
+# bddl file entirely -- hence this dedicated task-set (a filtered copy of LIBERO_90_LILO22_CONFIGS
+# with that one entry swapped) instead of trying to label it via the shared "libero_90_lilo22" set.
+_MIMICGEN_KITCHEN4_BOWL_DRAWER_WIDE = TaskConfig(
+    hdf5_name="KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_demo.hdf5",
+    bddl_name="KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet.bddl",
+    skills=[
+        SkillSpec("Pick Black Bowl", GraspEvent("akita_black_bowl_1")),
+        SkillSpec("Place Black Bowl in Bottom Drawer", PredicateEvent("in", ("akita_black_bowl_1", "wooden_cabinet_1_bottom_region"))),
+    ],
+    bddl_subdir=os.environ.get(
+        "LILO22_WOODEN_CABINET_BDDL_DIR",
+        "/data/zeyu/PHD_LAB/Amazon_Project/libero_rerender_script/bddl_wooden_cabinet",
+    ),
+)
+LIBERO_90_LILO22_MIMICGEN_CONFIGS: list[TaskConfig] = [
+    _MIMICGEN_KITCHEN4_BOWL_DRAWER_WIDE
+    if c.hdf5_name == _MIMICGEN_KITCHEN4_BOWL_DRAWER_WIDE.hdf5_name
+    else c
+    for c in LIBERO_90_LILO22_CONFIGS
 ]
 
 # name -> (task configs, bddl_files subdirectory to resolve bddl_name against; "" = per-task)
@@ -786,6 +833,7 @@ TASK_SET_REGISTRY: dict[str, tuple[list[TaskConfig], str]] = {
     "libero_90_lilo22": (LIBERO_90_LILO22_CONFIGS, "libero_90"),
     "lilo22_new": (LILO22_NEW_CONFIGS, ""),
     "lilo22_wooden_cabinet": (LILO22_WOODEN_CABINET_CONFIGS, ""),
+    "libero_90_lilo22_mimicgen": (LIBERO_90_LILO22_MIMICGEN_CONFIGS, "libero_90"),
 }
 
 
@@ -1189,39 +1237,56 @@ def main(args: argparse.Namespace) -> None:
         bddl_path = BDDL_FILES_ROOT / (task.bddl_subdir or default_bddl_subdir) / task.bddl_name
         logging.info(f"=== {task.data_subdir + '/' if task.data_subdir else ''}{task.hdf5_name} ===")
 
-        with h5py.File(hdf5_path, "r") as f:
-            data_grp = f["data"]
-            # Files that went through OpenVLA-style regeneration (libero_modified_hdf5/*) may carry no
-            # attributes at all -- fall back to the BDDL's own :language line.
-            if "problem_info" in data_grp.attrs:
-                instruction = json.loads(data_grp.attrs["problem_info"])["language_instruction"]
-            else:
-                instruction = _language_from_bddl(bddl_path)
+        # A task-set registry entry may legitimately not have its HDF5 present in this particular
+        # --data-dir (e.g. running the full libero_90_lilo22 registry against a directory that only
+        # holds a handful of regenerated/MimicGen task files) -- skip rather than crash the whole batch.
+        if not hdf5_path.is_file():
+            logging.info(f"  (skip: {hdf5_path} not found)")
+            continue
 
-            # Two group layouts: a raw/OpenVLA-regenerated file has only "data"; a
-            # libero_modified_hdf5-style file also has "data_distractor" (randomized-distractor
-            # episodes, see libero_rerender_script/rerender_libero90.py) -- both get boundaries,
-            # since they run the identical action sequence and only the decor differs.
-            groups = [data_grp] + ([f["data_distractor"]] if "data_distractor" in f else [])
-            demo_names = sorted(
-                (k for g in groups for k in g.keys()),
-                key=lambda s: tuple(int(x) for x in s.split("_")[1:] if x.isdigit()),
-            )
-            if args.max_demos is not None:
-                demo_names = demo_names[: args.max_demos]
+        try:
+            with h5py.File(hdf5_path, "r") as f:
+                data_grp = f["data"]
+                # Files that went through OpenVLA-style regeneration (libero_modified_hdf5/*) may carry no
+                # attributes at all -- fall back to the BDDL's own :language line.
+                if "problem_info" in data_grp.attrs:
+                    instruction = json.loads(data_grp.attrs["problem_info"])["language_instruction"]
+                else:
+                    instruction = _language_from_bddl(bddl_path)
 
-            has_raw_attrs = "env_args" in data_grp.attrs
-            env = _build_env(json.loads(data_grp.attrs["env_args"]), bddl_path) if has_raw_attrs else _build_env_simple(bddl_path)
-            try:
-                demo_results = {}
-                for demo_name in demo_names:
-                    logging.info(f"  {demo_name} ({len(demo_results) + 1}/{len(demo_names)})...")
-                    group = data_grp if demo_name in data_grp else f["data_distractor"]
-                    demo_results[demo_name] = annotate_demo(env, group[demo_name], task, label_phases=args.label_phases)
-                    if demo_results[demo_name]["order_anomaly"]:
-                        logging.warning(f"  {demo_name}: sub-skill order anomaly (see order_anomaly flag)")
-            finally:
-                env.close()
+                # Two group layouts: a raw/OpenVLA-regenerated file has only "data"; a
+                # libero_modified_hdf5-style file also has "data_distractor" (randomized-distractor
+                # episodes, see libero_rerender_script/rerender_libero90.py) -- both get boundaries,
+                # since they run the identical action sequence and only the decor differs.
+                groups = [data_grp] + ([f["data_distractor"]] if "data_distractor" in f else [])
+                demo_names = sorted(
+                    (k for g in groups for k in g.keys()),
+                    key=lambda s: tuple(int(x) for x in s.split("_")[1:] if x.isdigit()),
+                )
+                if args.max_demos is not None:
+                    demo_names = demo_names[: args.max_demos]
+
+                has_raw_attrs = "env_args" in data_grp.attrs
+                env = _build_env(json.loads(data_grp.attrs["env_args"]), bddl_path) if has_raw_attrs else _build_env_simple(bddl_path)
+                try:
+                    demo_results = {}
+                    for demo_name in demo_names:
+                        logging.info(f"  {demo_name} ({len(demo_results) + 1}/{len(demo_names)})...")
+                        group = data_grp if demo_name in data_grp else f["data_distractor"]
+                        demo_results[demo_name] = annotate_demo(env, group[demo_name], task, label_phases=args.label_phases)
+                        if demo_results[demo_name]["order_anomaly"]:
+                            logging.warning(f"  {demo_name}: sub-skill order anomaly (see order_anomaly flag)")
+                finally:
+                    env.close()
+        except Exception:
+            # A registry entry's bddl/skill predicates are only valid for the scene they describe --
+            # pointing the SAME task-set at a differently-scened file sharing that hdf5_name (e.g. a
+            # MimicGen-regenerated task whose fixture/site names differ from the stock task) can raise
+            # here. Log and skip rather than aborting every other (correct) task file in the batch; the
+            # offending file should instead get its own dedicated TaskConfig in a separate registry
+            # entry and be re-run with --merge to overwrite this skip.
+            logging.exception(f"  failed on {task.hdf5_name} -- skipping this task file")
+            continue
 
         results[task.hdf5_name] = {
             "task_instruction": instruction,
