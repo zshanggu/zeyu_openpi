@@ -1051,6 +1051,82 @@ _CONFIGS = [
         save_interval=1000,
         keep_period=2000,
     ),
+    TrainConfig(
+        # Real-world (non-sim) teleop demos -- coffee_box/cup_on_plate/hang_the_tape/ketchup_box --
+        # hand-labeled with sub-skill boundaries in hdf5-lerobot-visualizer's web viewer and split into
+        # one episode per sub-skill by examples/franka_towel/convert_real_subskills_to_lerobot.py (402
+        # episodes, 8 sub-skills, state/action layout identical to franka_towel so LeRobotLiberoDataConfig/
+        # LiberoInputs are reused as-is). subskill_aux_mode="classification_head" adds the phase/done
+        # auxiliary heads -- same mechanism as pi05_libero_90_lilo22_low_mem_finetune, see its comment.
+        # Must run `uv run scripts/compute_norm_stats.py --config-name
+        # pi05_real_world_subskills_low_mem_finetune` once before training with this config for the
+        # first time (writes <local_root>/meta/norm_stats.json).
+        name="pi05_real_world_subskills_low_mem_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            aux_signal_mode="classification_head",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="real_world_subskills",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            local_root="/data/zeyu/PHD_LAB/Amazon_Project/lerobot_datasets/real_world_subskills",
+            subskill_aux_mode="classification_head",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=32,
+        num_train_steps=10_000,
+        save_interval=1000,
+        keep_period=2000,
+    ),
+    TrainConfig(
+        # Same real-world sub-skill dataset as pi05_real_world_subskills_low_mem_finetune above, but
+        # phase/done ride as 2 extra dims on `actions` itself instead of separate classification heads --
+        # see Pi0Config.aux_signal_mode's docstring for the tradeoff, and
+        # pi05_libero_90_lilo22_low_mem_finetune_action_dim_aux for why this needs its OWN norm_stats
+        # (the 9-dim actions_with_aux column has different stats than the 7-dim actions column the
+        # classification_head/none variants above share). Must run `uv run scripts/compute_norm_stats.py
+        # --config-name pi05_real_world_subskills_low_mem_finetune_action_dim_aux` once before training
+        # with this config for the first time (writes <local_root>/meta_action_dim_aux/norm_stats.json).
+        name="pi05_real_world_subskills_low_mem_finetune_action_dim_aux",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            aux_signal_mode="action_dim",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="real_world_subskills",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            local_root="/data/zeyu/PHD_LAB/Amazon_Project/lerobot_datasets/real_world_subskills",
+            subskill_aux_mode="action_dim",
+            assets=AssetsConfig(asset_id="meta_action_dim_aux"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=32,
+        num_train_steps=10_000,
+        save_interval=1000,
+        keep_period=2000,
+    ),
     #
     # Fine-tuning Aloha configs.
     #
