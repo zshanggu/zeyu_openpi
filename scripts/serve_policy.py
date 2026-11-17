@@ -185,10 +185,17 @@ class ReloadablePolicy(_base_policy.BasePolicy):
         # XLA_PYTHON_CLIENT_MEM_FRACTION=0.30). Loading first and freeing after needs two at once -> OOM.
         self._policy = None
         gc.collect()
+        error = None
         try:
             self._policy = self._load(config_name, checkpoint_dir)
         except Exception as exc:  # noqa: BLE001 -- reported to the client, not raised
             logging.exception("Checkpoint reload failed")
+            error = str(exc)
+        if error is not None:
+            # Collect only after leaving the except block: until then the exception's traceback keeps the
+            # half-built policy's frames (and its params on the GPU) alive, so restoring the previous checkpoint
+            # would need room for two at once and run out of memory (e.g. a wrong config whose norm stats are
+            # missing fails after the params were already loaded).
             self._policy = None
             gc.collect()
             if self._current is not None:
@@ -198,7 +205,7 @@ class ReloadablePolicy(_base_policy.BasePolicy):
                     logging.info("Restored previous checkpoint: config=%s dir=%s", *self._current)
                 except Exception:  # noqa: BLE001
                     logging.exception("Restoring the previous checkpoint failed too; no policy loaded")
-            return {"reload_error": str(exc)}
+            return {"reload_error": error}
         self._current = (config_name, checkpoint_dir)
         logging.info("Checkpoint reload complete: config=%s dir=%s", config_name, checkpoint_dir)
         return {
