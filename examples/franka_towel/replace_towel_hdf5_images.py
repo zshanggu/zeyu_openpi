@@ -27,6 +27,11 @@ and data.attrs["total"] is the number of frames written. Each written demo gets 
 image_source_video (the video path) and image_source_hdf5; with --demos, data.attrs["image_demo_list"]
 is the list file.
 
+With --keep-unreplaced, every source demo that is not replaced (not listed in --demos, no video, a
+mismatching video, or beyond --max-episodes) is still written, copied unchanged with its simulator
+images, so the output has as many demos as the source (e.g. 40 listed of 50 -> 40 replaced + 10 kept).
+Every written demo then gets attrs image_replaced (True/False); kept demos have no image_source_video.
+
 Usage:
     uv run examples/franka_towel/replace_towel_hdf5_images.py \
         --hdf5 /data/hyeonahj/share/craft_hdf5/franka_towel_n750_seeds23.hdf5 \
@@ -39,6 +44,10 @@ Usage:
         --videos /home/zeyu/PHD_LAB/DEFORMABLE/hdf5/simulation_from_eric/franka_towel_zeyu_n50_seeds23 \
         --demos .../outputs/gui/franka_towel_zeyu_n50_seeds23/demos_overall_mean_top80_vlmscore_lt0.2.txt \
         --out franka_towel_zeyu_n50_seeds23_cosmos_selected.hdf5
+
+    # the listed demos replaced, all other demos kept with their simulator images
+    uv run examples/franka_towel/replace_towel_hdf5_images.py ... --demos <list>.txt --keep-unreplaced \
+        --out franka_towel_zeyu_n50_seeds23_cosmos_selected_plus_sim.hdf5
 
 Then convert it like any other towel file with convert_towel_hdf5_to_lerobot.py.
 """
@@ -119,6 +128,7 @@ def main(
     suffix: str = "01",
     demos: str | None = None,
     max_episodes: int | None = None,
+    keep_unreplaced: bool = False,
     overwrite: bool = False,
 ) -> None:
     """
@@ -129,7 +139,9 @@ def main(
         suffix: Video name suffix: demo_NNN_<suffix>.mp4.
         demos: Text file listing the demos to keep (demo_007, demo_7 or 7 per line); only these are
             written. Default: every demo that has a video.
-        max_episodes: If set, only write the first N matched demos (quick test).
+        max_episodes: If set, only replace the first N matched demos (quick test).
+        keep_unreplaced: Also write every source demo that is not replaced, unchanged (simulator
+            images), so the output keeps all source demos.
         overwrite: Replace `out` if it exists.
     """
     hdf5_path, videos_path, out_path = Path(hdf5), Path(videos), Path(out)
@@ -151,6 +163,7 @@ def main(
     tmp_path = out_path.with_name(out_path.name + ".partial")
     skipped: dict[str, str] = {}
     written: list[str] = []
+    kept: list[str] = []
     total = 0
     with h5py.File(hdf5_path, "r") as src, h5py.File(tmp_path, "w") as dst:
         for k, v in src.attrs.items():
@@ -161,6 +174,7 @@ def main(
             dst_data.attrs[k] = v
 
         demo_keys = sorted(src_data.keys(), key=lambda k: int(k.split("_")[1]))
+        all_keys = list(demo_keys)
         unused = sorted(set(video_of) - set(demo_keys))
         if unused:
             print(f"warning: {len(unused)} videos have no demo in the HDF5: {unused}")
@@ -207,8 +221,19 @@ def main(
             copy_like(wrist, out_obs, frames[:, :, width:])
             out_demo.attrs["image_source_video"] = str(video_of[key])
             out_demo.attrs["image_source_hdf5"] = str(hdf5_path)
+            if keep_unreplaced:
+                out_demo.attrs["image_replaced"] = True
             written.append(key)
             total += num_steps
+
+        if keep_unreplaced:
+            dst_data.attrs["keep_unreplaced"] = True
+            for key in tqdm.tqdm([k for k in all_keys if k not in set(written)], desc="keep unreplaced"):
+                src.copy(src_data[key], dst_data, name=key)  # as stored, simulator images
+                dst_data[key].attrs["image_replaced"] = False
+                dst_data[key].attrs["image_source_hdf5"] = str(hdf5_path)
+                kept.append(key)
+                total += src_data[key]["obs"][ROOM_CAMERA].shape[0]
 
         dst_data.attrs["total"] = str(total) if isinstance(src_data.attrs.get("total"), str) else total
     tmp_path.replace(out_path)
@@ -216,7 +241,11 @@ def main(
     reasons: dict[str, list[str]] = {}
     for key, reason in skipped.items():
         reasons.setdefault("no video" if reason == "no video" else "mismatch", []).append(f"{key}: {reason}")
-    print(f"Wrote {len(written)} demos, {total} frames to {out_path}")
+    print(f"Wrote {len(written) + len(kept)} demos, {total} frames to {out_path}")
+    print(f"  {len(written)} with replaced images" + (f", {len(kept)} kept unchanged (simulator images)"
+                                                     if keep_unreplaced else ""))
+    if keep_unreplaced:
+        return  # nothing was left out
     if listed is not None:
         print(f"Left out {not_listed} source demos not listed in {demos}")
         for line in reasons.get("no video", []):  # a listed demo without its video is worth a line each

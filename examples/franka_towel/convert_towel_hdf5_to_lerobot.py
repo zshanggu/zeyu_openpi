@@ -38,6 +38,11 @@ Usage:
 Several HDF5 files (same env and camera layout) can be merged into one dataset: pass them all to
 --hdf5, e.g. `--hdf5 a.hdf5 b.hdf5`. Their episodes are written file by file, in the given order.
 
+Multi-task: files from different envs (e.g. towel, rope and Jenga) can be merged when they share the camera,
+state and action layout and the control rate. Give one prompt per file with --prompts, in --hdf5 order:
+    --hdf5 towel.hdf5 rope.hdf5 jenga.hdf5 \
+    --prompts "fold the towel" "arrange the rope into a loop" "use the stick to push the red block out of the tower"
+
 Then pass the same directory to `scripts/compute_norm_stats.py --local-root` (or rely on the
 `pi05_franka_towel_*` configs' local_root) and train.
 
@@ -86,6 +91,7 @@ def main(
     repo_name: str = "franka_towel",
     output_dir: str | None = None,
     prompt: str = "fold the towel",
+    prompts: list[str] | None = None,
     state: str = "eef",
     image_size: int = 256,
     max_episodes: int | None = None,
@@ -102,6 +108,8 @@ def main(
         output_dir: Write the dataset directly to this directory (recommended) -- pass the SAME directory
             as `local_root` to compute_norm_stats.py / train.py. Deleted first if it exists.
         prompt: Language instruction stored as every frame's task.
+        prompts: One instruction per --hdf5 file (same order), instead of --prompt. Required to merge files
+            from different envs (multi-task); the files must still share the control rate.
         state: State layout, "eef" or "joint" (see module docstring).
         image_size: Images are resized (with padding) to image_size x image_size. The model resizes to
             224 anyway; storing the native 512x512 only makes the dataset larger.
@@ -114,19 +122,32 @@ def main(
     if output_path.exists():
         shutil.rmtree(output_path)
 
-    # Every file must run at the same control rate (and come from the same env).
+    if prompts is not None and len(prompts) != len(hdf5_paths):
+        raise ValueError(f"--prompts has {len(prompts)} entries for {len(hdf5_paths)} --hdf5 files")
+    file_prompts = list(prompts) if prompts is not None else [prompt] * len(hdf5_paths)
+
+    def _fps(args: dict) -> int:
+        sim = args.get("sim_args", {})
+        return round(1.0 / (sim.get("dt", 0.01) * sim.get("decimation", 5)))
+
+    # Every file must run at the same control rate, and come from the same env unless --prompts is given
+    # (multi-task: each file is its own task with its own prompt).
     env_args = None
+    env_names = []
     for hdf5_path in hdf5_paths:
         with h5py.File(hdf5_path, "r") as f:
             args = json.loads(f["data"].attrs["env_args"])
-        if env_args is not None and (args.get("env_name"), args.get("sim_args")) != (
-            env_args.get("env_name"),
-            env_args.get("sim_args"),
-        ):
-            raise ValueError(f"{hdf5_path}: env_args differ from {hdf5_paths[0]}")
+        env_names.append(args.get("env_name"))
+        if env_args is not None:
+            if _fps(args) != _fps(env_args):
+                raise ValueError(f"{hdf5_path}: {_fps(args)} Hz, {hdf5_paths[0]}: {_fps(env_args)} Hz")
+            if prompts is None and (args.get("env_name"), args.get("sim_args")) != (
+                env_args.get("env_name"),
+                env_args.get("sim_args"),
+            ):
+                raise ValueError(f"{hdf5_path}: env_args differ from {hdf5_paths[0]} (pass --prompts for multi-task)")
         env_args = args
-    sim = env_args.get("sim_args", {})
-    fps = round(1.0 / (sim.get("dt", 0.01) * sim.get("decimation", 5)))
+    fps = _fps(env_args)
 
     dataset = LeRobotDataset.create(
         repo_id=repo_name,
@@ -153,7 +174,7 @@ def main(
 
     episodes: list[str] = []  # "<file>:<demo>" in dataset episode order
     num_frames = 0
-    for hdf5_path in hdf5_paths:
+    for hdf5_path, file_prompt in zip(hdf5_paths, file_prompts):
         with h5py.File(hdf5_path, "r") as f:
             data = f["data"]
             demo_keys = sorted(data.keys(), key=lambda k: int(k.split("_")[1]))
@@ -175,7 +196,7 @@ def main(
                             "wrist_image": wrist[i],
                             "state": states[i],
                             "actions": actions[i],
-                            "task": prompt,
+                            "task": file_prompt,
                         }
                     )
                 dataset.save_episode()
@@ -184,11 +205,11 @@ def main(
 
     info = {
         "source_hdf5": [str(p.resolve()) for p in hdf5_paths],
-        "env_name": env_args.get("env_name"),
+        "env_name": env_names[0] if len(set(env_names)) == 1 else env_names,
         "fps": fps,
         "episodes": episodes,
         "frames": num_frames,
-        "prompt": prompt,
+        "prompt": file_prompts[0] if len(set(file_prompts)) == 1 else file_prompts,
         "state_layout": state,
         "state_names": (
             ["eef_x", "eef_y", "eef_z", "quat_w", "quat_x", "quat_y", "quat_z", "finger_1", "finger_2"]
