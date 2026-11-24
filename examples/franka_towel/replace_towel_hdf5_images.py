@@ -49,13 +49,22 @@ Usage:
     uv run examples/franka_towel/replace_towel_hdf5_images.py ... --demos <list>.txt --keep-unreplaced \
         --out franka_towel_zeyu_n50_seeds23_cosmos_selected_plus_sim.hdf5
 
+Speed: --workers processes (default 8) decode the videos and gzip the new image chunks in parallel; the main
+process writes the compressed chunks as they are (h5py write_direct_chunk), in demo order, so the HDF5 is still
+written by one process. The output is the same as writing the images with h5py's own gzip filter. A source image
+dataset with other filters (shuffle, fletcher32, not gzip) falls back to plain writes in the main process.
+--workers 0 does everything in the main process.
+
 Then convert it like any other towel file with convert_towel_hdf5_to_lerobot.py.
 """
 
 from __future__ import annotations
 
+import itertools
+import multiprocessing
 from pathlib import Path
 import re
+import zlib
 
 import av
 import h5py
@@ -107,6 +116,66 @@ def read_video(path: Path) -> np.ndarray:
         return np.stack([frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)])
 
 
+def chunk_layout(src: h5py.Dataset) -> dict | None:
+    """How a worker can compress data for `src` itself: its chunk shape and gzip level (None: no compression).
+    None when the dataset uses anything write_direct_chunk + zlib can't reproduce (then the main process
+    writes it with h5py's filters)."""
+    if src.chunks is None or src.shuffle or src.fletcher32 or src.scaleoffset is not None:
+        return None
+    if src.compression not in (None, "gzip"):
+        return None
+    return {"chunks": src.chunks, "level": src.compression_opts if src.compression == "gzip" else None}
+
+
+def compress_chunks(data: np.ndarray, layout: dict) -> list[tuple[tuple[int, ...], bytes]]:
+    """(chunk offset, stored bytes) for every chunk of `data`, as HDF5's deflate filter stores them (a zlib
+    stream). Edge chunks are padded to the full chunk shape with the fill value 0, as HDF5 stores them."""
+    chunks, level = layout["chunks"], layout["level"]
+    out = []
+    for offset in itertools.product(*(range(0, n, c) for n, c in zip(data.shape, chunks))):
+        block = data[tuple(slice(o, o + c) for o, c in zip(offset, chunks))]
+        if block.shape != tuple(chunks):
+            block = np.pad(block, [(0, c - b) for c, b in zip(chunks, block.shape)])
+        raw = np.ascontiguousarray(block).tobytes()
+        out.append((offset, raw if level is None else zlib.compress(raw, level)))
+    return out
+
+
+def prepare_demo(job: dict) -> dict:
+    """Worker: decode one video, check it against the demo, split it into room | wrist and compress their chunks
+    (or return the plain arrays when a layout is None). Touches no HDF5 file."""
+    frames = read_video(job["video"])
+    num_steps, height, width = job["shape"]
+    if len(frames) != num_steps:
+        return {"skip": f"video has {len(frames)} frames, hdf5 has {num_steps}"}
+    if frames.shape[1:3] != (height, 2 * width) or job["wrist_hw"] != (height, width):
+        return {"skip": f"video frame {frames.shape[2]}x{frames.shape[1]}, expected {2 * width}x{height}"}
+    out = {}
+    for name, data in ((ROOM_CAMERA, frames[:, :, :width]), (WRIST_CAMERA, frames[:, :, width:])):
+        data = data.astype(job["dtype"][name], copy=False)
+        layout = job["layout"][name]
+        out[name] = ("chunks", compress_chunks(data, layout)) if layout else ("array", np.ascontiguousarray(data))
+    return out
+
+
+def write_prepared(src: h5py.Dataset, dst: h5py.Group, prepared: tuple) -> None:
+    """Create a dataset like `src` in `dst` and fill it with what prepare_demo returned."""
+    kind, payload = prepared
+    if kind == "array":
+        copy_like(src, dst, payload)
+        return
+    ds = dst.create_dataset(
+        Path(src.name).name,
+        shape=src.shape,
+        dtype=src.dtype,
+        chunks=src.chunks,
+        compression=src.compression,
+        compression_opts=src.compression_opts,
+    )
+    for offset, data in payload:
+        ds.id.write_direct_chunk(offset, data)
+
+
 def copy_like(src: h5py.Dataset, dst: h5py.Group, data: np.ndarray) -> None:
     """Write `data` under src's name with src's dtype, chunking and compression."""
     dst.create_dataset(
@@ -129,6 +198,7 @@ def main(
     demos: str | None = None,
     max_episodes: int | None = None,
     keep_unreplaced: bool = False,
+    workers: int = 8,
     overwrite: bool = False,
 ) -> None:
     """
@@ -142,6 +212,7 @@ def main(
         max_episodes: If set, only replace the first N matched demos (quick test).
         keep_unreplaced: Also write every source demo that is not replaced, unchanged (simulator
             images), so the output keeps all source demos.
+        workers: Processes that decode videos and compress images in parallel (0: all in the main process).
         overwrite: Replace `out` if it exists.
     """
     hdf5_path, videos_path, out_path = Path(hdf5), Path(videos), Path(out)
@@ -158,6 +229,9 @@ def main(
             raise ValueError(f"{len(missing)} listed demos are not in {hdf5_path}: {missing}")
     video_of = find_videos(videos_path, suffix)
     print(f"{len(video_of)} videos demo_*_{suffix}.mp4 in {videos_path}")
+
+    # Started before any HDF5 file is open, so no worker inherits an open h5py handle.
+    pool = multiprocessing.get_context("fork").Pool(workers) if workers > 0 else None
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = out_path.with_name(out_path.name + ".partial")
@@ -190,17 +264,26 @@ def main(
         if max_episodes is not None:
             candidates = candidates[:max_episodes]
 
-        for key in tqdm.tqdm(candidates, desc=out_path.stem):
+        jobs = []
+        for key in candidates:
+            obs = src_data[key]["obs"]
+            room, wrist = obs[ROOM_CAMERA], obs[WRIST_CAMERA]
+            jobs.append({
+                "video": video_of[key],
+                "shape": room.shape[:3],
+                "wrist_hw": wrist.shape[1:3],
+                "dtype": {ROOM_CAMERA: room.dtype, WRIST_CAMERA: wrist.dtype},
+                "layout": {ROOM_CAMERA: chunk_layout(room), WRIST_CAMERA: chunk_layout(wrist)},
+            })
+        # Results come back in demo order; workers run ahead while the main process writes.
+        results = pool.imap(prepare_demo, jobs) if pool else map(prepare_demo, jobs)
+
+        for key, prepared in tqdm.tqdm(zip(candidates, results), total=len(candidates), desc=out_path.stem):
             demo = src_data[key]
             room, wrist = demo["obs"][ROOM_CAMERA], demo["obs"][WRIST_CAMERA]
-            num_steps, height, width = room.shape[:3]
-            frames = read_video(video_of[key])
-            if len(frames) != num_steps:
-                skipped[key] = f"video has {len(frames)} frames, hdf5 has {num_steps}"
-                tqdm.tqdm.write(f"leave out {key}: {skipped[key]} ({video_of[key]})")
-                continue
-            if frames.shape[1:3] != (height, 2 * width) or wrist.shape[1:3] != (height, width):
-                skipped[key] = f"video frame {frames.shape[2]}x{frames.shape[1]}, expected {2 * width}x{height}"
+            num_steps = room.shape[0]
+            if "skip" in prepared:
+                skipped[key] = prepared["skip"]
                 tqdm.tqdm.write(f"leave out {key}: {skipped[key]} ({video_of[key]})")
                 continue
 
@@ -217,8 +300,9 @@ def main(
             for name in demo["obs"]:
                 if name not in (ROOM_CAMERA, WRIST_CAMERA):
                     src.copy(demo["obs"][name], out_obs, name=name)
-            copy_like(room, out_obs, frames[:, :, :width])
-            copy_like(wrist, out_obs, frames[:, :, width:])
+            write_prepared(room, out_obs, prepared[ROOM_CAMERA])
+            write_prepared(wrist, out_obs, prepared[WRIST_CAMERA])
+            del prepared
             out_demo.attrs["image_source_video"] = str(video_of[key])
             out_demo.attrs["image_source_hdf5"] = str(hdf5_path)
             if keep_unreplaced:
@@ -236,6 +320,9 @@ def main(
                 total += src_data[key]["obs"][ROOM_CAMERA].shape[0]
 
         dst_data.attrs["total"] = str(total) if isinstance(src_data.attrs.get("total"), str) else total
+    if pool:
+        pool.close()
+        pool.join()
     tmp_path.replace(out_path)
 
     reasons: dict[str, list[str]] = {}
